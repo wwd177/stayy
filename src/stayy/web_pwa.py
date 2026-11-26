@@ -603,6 +603,7 @@ class WebPwaServer:
         self._processed_client_ids: OrderedDict[str, float] = OrderedDict()
         self._cancelled_reply_ids: set[str] = set()
         self._nav_seq: int = 0
+        self._watch_gen: int = 0
         self._ide_watch_sig: tuple[str, str, int, int] = ("", "", 0, 0)
         self.pc_ide_poll_interval: float = 0.55
         self.pc_ide_accept_timeout: float = 10.0
@@ -1590,6 +1591,8 @@ class WebPwaServer:
                         break
 
                     def _invoke_desk_handler() -> tuple[bool, str]:
+                        if not self.auth.is_epoch_active(conn_epoch):
+                            return (False, "配对已撤销，动作已取消")
                         try:
                             return self._desktop_input_handler(act_kind, xr, yr, kname, txt_payload)
                         except TypeError:
@@ -3401,6 +3404,8 @@ class WebPwaServer:
             return
 
         snap_nav = self._nav_seq
+        self._watch_gen += 1
+        snap_gen = self._watch_gen
         snap = (snap_nav, cur_slot, ide_cid, watch_store)
 
         sig = await asyncio.to_thread(
@@ -3451,6 +3456,7 @@ class WebPwaServer:
         now_store = str(meta_now.get("store") or session.linked_store or "ide")
         if (
             self._nav_seq != snap[0]
+            or self._watch_gen != snap_gen
             or self._active_slot != snap[1]
             or now_cid != snap[2]
             or now_store != snap[3]

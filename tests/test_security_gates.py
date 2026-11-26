@@ -31,6 +31,7 @@ from stayy.notifier import (
     SAFE_NOTIFY_TITLE,
     BarkNotifier,
     _NoRedirectHandler,
+    _PinnedHTTPSConnection,
     post_sanitized_bark_push,
     redact_url,
     validate_bark_url,
@@ -683,6 +684,25 @@ async def test_m2_branch_b_approval_tracker_watch_race_and_shared_screen_hub(
                 assert len(pwa._screen_subs) == 0
                 assert pwa._screen_producer_task is None or pwa._screen_producer_task.done()
 
+                # Rapid unsubscribe + immediate resubscribe churn -> exactly ONE active producer & fresh frame delivered
+                await ws1.send(json.dumps({"type": "live_screen", "enable": True, "interval_ms": 600}))
+                await ws1.send(json.dumps({"type": "live_screen", "enable": False}))
+                await ws1.send(json.dumps({"type": "live_screen", "enable": True, "interval_ms": 600}))
+                churn_frame = False
+                for _ in range(12):
+                    ev = json.loads(await asyncio.wait_for(ws1.recv(), timeout=2.5))
+                    if ev.get("type") == "desktop_frame":
+                        churn_frame = True
+                        break
+                assert churn_frame is True
+                assert len(pwa._screen_subs) == 1
+                assert pwa._screen_producer_task is not None and not pwa._screen_producer_task.done()
+                await ws1.send(json.dumps({"type": "live_screen", "enable": False}))
+                for _ in range(30):
+                    if pwa._screen_producer_task is None or pwa._screen_producer_task.done():
+                        break
+                    await asyncio.sleep(0.05)
+
             # Server-side capability rejection for disabled remote_desktop
             orig_caps = pwa._build_capabilities
             monkeypatch.setattr(
@@ -773,6 +793,29 @@ def test_m3_bark_notifier_ssrf_sanitization_and_coalescing(
     assert ok_err is False
     assert "SENTINEL_BARK_TOKEN_123456" not in msg_err
     assert redact_url(sent_bark_url) in msg_err
+
+    # 3b. Verify _PinnedHTTPSConnection connects strictly to pinned IP (immune to post-validation DNS rebinding)
+    dialed_addrs: list[tuple[str, int]] = []
+    sni_hosts: list[str | None] = []
+
+    class _DummySock:
+        def close(self) -> None:
+            pass
+
+    class _DummySSL:
+        def wrap_socket(self, sock, server_hostname=None):  # noqa: ARG002
+            sni_hosts.append(server_hostname)
+            return sock
+
+    monkeypatch.setattr(
+        "stayy.notifier.socket.create_connection",
+        lambda addr, *_a, **_kw: dialed_addrs.append(addr) or _DummySock(),
+    )
+    conn = _PinnedHTTPSConnection("api.day.app:8443", pinned_ips=["93.184.216.34"])
+    conn._context = _DummySSL()  # type: ignore[assignment]
+    conn.connect()
+    assert dialed_addrs == [("93.184.216.34", 8443)]
+    assert sni_hosts == ["api.day.app"]
 
     # 4. Bounded cooldown coalescing & repeated prompt event_key re-notification
     send_times: list[float] = []

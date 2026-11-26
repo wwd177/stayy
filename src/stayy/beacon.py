@@ -380,8 +380,8 @@ def verify_published_beacon(
     try:
         parsed = decrypt_beacon_payload(env_data, access_token, max_age_sec=600)
     except Exception as exc:
-        # Either CDN still serves old version or another host pushed a different token
-        return False, "host_conflict", f"目标信标无法使用当前密钥解密（可能尚未刷新或存在其他主机）：{exc}"
+        # Either CDN still serves an older key version or another host pushed with a different secret
+        return False, "decrypt_failed", f"目标信标无法使用当前密钥解密（可能为旧密钥缓存或另一主机）：{exc}"
 
     if parsed.get("host_id") != expected_host_id:
         return False, "host_conflict", "目标分支当前绑定着另一台主机的 host_id，已拒绝复用"
@@ -420,6 +420,12 @@ def publish_ios_pwa_and_beacon(
     extra = {"creationflags": CREATE_NO_WINDOW} if sys.platform == "win32" else {}
 
     with _BEACON_PUBLISH_LOCK:
+        if verify_live:
+            pre_ok, pre_state, pre_detail = verify_published_beacon(
+                pages_url, access_token, host_id, expected_nonce="__precheck__", timeout=4.0
+            )
+            if not pre_ok and pre_state == "host_conflict":
+                return (False, "host_conflict", pre_detail)
         try:
             if stage_dir.exists():
                 shutil.rmtree(stage_dir, ignore_errors=True)
