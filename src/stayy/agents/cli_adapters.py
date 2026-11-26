@@ -165,10 +165,11 @@ def build_copilot_command(
     allow_write: bool = False,
 ) -> tuple[list[str], dict[str, str]]:
     """Build safe argument list for GitHub Copilot CLI (non-interactive, read-only tool denials by default)."""
+    safe_prompt = f" {prompt}" if prompt.lstrip().startswith("-") else prompt
     cmd = [
         install_info["exe"],
         "-p",
-        prompt,
+        safe_prompt,
         "--output-format",
         "json",
         "--no-ask-user",
@@ -446,6 +447,19 @@ async def run_cli_agent_turn(
             *[t for t in (cancel_task, stderr_task) if t is not None],
             return_exceptions=True,
         )
+        if proc.returncode is None:
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=2.0)
+            except Exception:
+                pass
+        tr = getattr(proc, "_transport", None)
+        if tr is not None:
+            try:
+                if hasattr(tr, "is_closing") and not tr.is_closing():
+                    tr.close()
+            except Exception:
+                pass
+        await asyncio.sleep(0)
         if cb.on_proc_finished:
             await cb.on_proc_finished(proc)
 

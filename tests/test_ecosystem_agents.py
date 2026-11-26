@@ -39,7 +39,12 @@ from stayy.agents.desktop_apps import (
     is_pe_executable_file,
     launch_desktop_ai_app,
 )
-from stayy.agents.openai_compat import run_openai_compat_turn, validate_llm_endpoint_url
+from stayy.agents.openai_compat import (
+    _safe_session_id,
+    load_api_session_history,
+    run_openai_compat_turn,
+    validate_llm_endpoint_url,
+)
 from stayy.agy_session import SessionManager
 from stayy.auth import atomic_update_env_vars
 from stayy.beacon import (
@@ -51,7 +56,7 @@ from stayy.beacon import (
     verify_published_beacon,
 )
 from stayy.config import BridgeConfig
-from stayy.conversations import list_local_conversations, load_conversation_detail
+from stayy.conversations import SAFE_CONV_ID_RE, list_local_conversations, load_conversation_detail
 from stayy.setup_wizard import run_doctor
 from stayy.web_pwa import WebPwaServer
 
@@ -973,6 +978,215 @@ async def test_e3_ws_desktop_app_launch_blocked_after_revoke(tmp_path: Path) -> 
                 for _ in range(4):
                     await asyncio.wait_for(ws.recv(), timeout=2.0)
             assert launch_calls == ["doubao"]
+    finally:
+        stop_event.set()
+        await asyncio.wait_for(srv_task, timeout=5.0)
+        await sessions.shutdown_all()
+
+
+@pytest.mark.asyncio
+async def test_edge_guards_sse_fast_cancel_partial_error_session_id_and_sandboxing(tmp_path: Path) -> None:
+    """Verify edge bug fixes: SAFE_CONV_ID_RE compat, copilot leading-dash guard, sandboxed desktop apps,
+    fast <1s SSE cancel interruption, and partial-error non-persistence."""
+    for raw in ("a.b/../../x", "s", "", "x" * 120):
+        sid = _safe_session_id(raw)
+        assert SAFE_CONV_ID_RE.match(sid), f"Invalid session id generated: {sid!r}"
+
+    cop_cmd, _ = build_copilot_command({"exe": "copilot.exe"}, prompt="--version 解释")
+    p_idx = cop_cmd.index("-p")
+    assert cop_cmd[p_idx + 1].startswith(" --version"), f"Expected leading space guard: {cop_cmd}"
+
+    # Passing local_app_data MUST isolate discovery completely from real host apps (F:\, ProgramFiles, etc.)
+    empty_la = tmp_path / "empty_la"
+    empty_la.mkdir()
+    assert discover_desktop_ai_apps(local_app_data=empty_la) == {}
+
+    mode = {"kind": "hang_after_header"}
+
+    class _EdgeSseHandler(http.server.BaseHTTPRequestHandler):
+        def do_POST(self) -> None:
+            length = int(self.headers.get("Content-Length") or 0)
+            _ = self.rfile.read(length) if length > 0 else b""
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+            self.end_headers()
+            if mode["kind"] == "hang_after_header":
+                # Keep socket open without sending DONE so cancel_event has to close the underlying socket
+                for _ in range(40):
+                    time.sleep(0.1)
+                return
+            if mode["kind"] == "partial_then_drop":
+                line = f"data: {json.dumps({'choices': [{'delta': {'content': '半截输出'}}]}, ensure_ascii=False)}\n\n".encode("utf-8")
+                self.wfile.write(line)
+                self.wfile.flush()
+                time.sleep(1.5)
+
+        def log_message(self, *_args: Any) -> None:
+            return
+
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _EdgeSseHandler)
+    port = srv.server_address[1]
+    t = threading.Thread(target=srv.serve_forever, daemon=True)
+    t.start()
+    try:
+        runtime_dir = tmp_path / ".runtime"
+        cancel_ev = asyncio.Event()
+        asyncio.get_running_loop().call_later(0.15, cancel_ev.set)
+        t0 = time.monotonic()
+        res_cancel = await run_openai_compat_turn(
+            store="doubao_api",
+            base_url=f"http://127.0.0.1:{port}/v1",
+            api_key="test-key-123",
+            model="ep-demo",
+            prompt="hello",
+            workspace=str(tmp_path),
+            session_id="fast-cancel-id",
+            runtime_dir=runtime_dir,
+            allow_local_ports=(port,),
+            chunk_timeout_sec=30.0,
+            total_timeout_sec=30.0,
+            cancel_event=cancel_ev,
+        )
+        elapsed = time.monotonic() - t0
+        assert res_cancel.aborted is True and not res_cancel.ok
+        assert elapsed < 1.2, f"Expected sub-second SSE cancel interruption, took {elapsed:.2f}s"
+
+        mode["kind"] = "partial_then_drop"
+        res_partial_err = await run_openai_compat_turn(
+            store="doubao_api",
+            base_url=f"http://127.0.0.1:{port}/v1",
+            api_key="test-key-123",
+            model="ep-demo",
+            prompt="partial",
+            workspace=str(tmp_path),
+            session_id="partial-drop-id",
+            runtime_dir=runtime_dir,
+            allow_local_ports=(port,),
+            chunk_timeout_sec=0.3,
+            total_timeout_sec=0.35,
+        )
+        assert not res_partial_err.ok
+        assert load_api_session_history(runtime_dir, "doubao_api", "partial-drop-id") == []
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+@pytest.mark.asyncio
+async def test_e3_unknown_store_no_agy_fallback_and_dsh_thought_plus_local_history_mirror(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verify unknown plugin stores never fall back to agy.exe, and DSH thought callbacks + sidebar reload preserve turns."""
+    from stayy.agents.base import AgentSpec
+
+    cfg = _make_config(tmp_path)
+    sessions = SessionManager(cfg, command_override=[sys.executable, str(MOCK_AGY)])
+    pwa = WebPwaServer(
+        cfg,
+        session_manager=sessions,
+        access_token=cfg.web_access_token,
+        runtime_dir=tmp_path / ".runtime",
+        ide_store_dir=tmp_path / "ide",
+        cli_store_dir=tmp_path / "cli",
+        codex_store_dir=tmp_path / "cdx",
+        dsh_store_dir=tmp_path / "dsh",
+        local_app_data=tmp_path / "empty_la",
+    )
+
+    dsh_proj_dir = tmp_path / "dsh" / "storages" / "session_projcache" / "sessions"
+    dsh_proj_dir.mkdir(parents=True)
+    dsh_cid = "sess_dsh_edge_01"
+
+    fake_dsh = tmp_path / "fake_dsh_edge.py"
+    fake_dsh.write_text(
+        f"""
+import json, pathlib, sys
+_ = sys.stdin.read()
+cid = {dsh_cid!r}
+print(json.dumps({{"sessionId": cid, "type": "thinking", "delta": "正在推理边界条件"}}), flush=True)
+print(json.dumps({{"sessionId": cid, "type": "text_delta", "delta": "DSH 已精准回答！"}}), flush=True)
+# Write projcache metadata WITHOUT turnOutline body (real DSH compressed archive shape)
+p = pathlib.Path({str(dsh_proj_dir)!r}) / f"{{cid}}.json"
+p.write_text(json.dumps({{"record": {{"identity": {{"cwd": {str(tmp_path)!r}, "createdAt": 1700000005000}}, "rows": {{"title": {{"val": "DSH 边界验证"}}}}}}}}), encoding="utf-8")
+""".strip(),
+        encoding="utf-8",
+    )
+
+    pwa.agent_registry._specs["dsh"] = AgentSpec(
+        id="dsh",
+        name="DeepSeek Harness",
+        vendor="DeepSeek",
+        kind="native_cli",
+        store="dsh",
+        installed=True,
+        configured=True,
+        read_only_enforced=True,
+        capabilities={"chat": True, "stream": True, "history": True, "resume": True, "cancel": True, "read_only_default": True},
+        internal_meta={"install": {"mode": "direct", "exe": "ignored"}},
+    )
+    monkeypatch.setattr(
+        "stayy.agents.cli_adapters.build_dsh_command",
+        lambda *_a, **_kw: ([sys.executable, str(fake_dsh)], {}),
+    )
+
+    stop_event = asyncio.Event()
+    srv_task = asyncio.create_task(pwa.run(stop_event=stop_event))
+    try:
+        await asyncio.sleep(0.25)
+        async with websockets.connect(f"ws://127.0.0.1:{cfg.web_pwa_port}/ws?token={cfg.web_access_token}") as ws:
+            _hello = json.loads(await asyncio.wait_for(ws.recv(), timeout=3.0))
+
+            # 1. Select `dsh` -> run turn -> observe `深度思考中` status & full preserved text after sidebar reload!
+            await ws.send(json.dumps({"type": "new_conversation", "target": "dsh", "open_pc_window": False}))
+            for _ in range(8):
+                ev = json.loads(await asyncio.wait_for(ws.recv(), timeout=3.0))
+                if ev["type"] == "meta_update" and ev.get("active_store") == "dsh":
+                    break
+
+            await ws.send(json.dumps({"type": "chat", "client_id": "dsh-c1", "text": "验证思考进度和正文保留"}))
+            saw_thought_status = False
+            saw_stream_end = False
+            for _ in range(25):
+                ev = json.loads(await asyncio.wait_for(ws.recv(), timeout=5.0))
+                if ev["type"] == "stream_status" and "深度思考中" in str(ev.get("status") or ""):
+                    saw_thought_status = True
+                if ev["type"] == "stream_end":
+                    saw_stream_end = True
+                    break
+            assert saw_thought_status and saw_stream_end
+
+            # Switch away then select back `dsh:<cid>` from sidebar -> local mirrored history MUST preserve user + assistant text!
+            await ws.send(json.dumps({"type": "new_conversation", "target": "cli", "open_pc_window": False}))
+            for _ in range(8):
+                ev = json.loads(await asyncio.wait_for(ws.recv(), timeout=3.0))
+                if ev["type"] == "meta_update" and ev.get("active_store") == "cli":
+                    break
+
+            await ws.send(json.dumps({"type": "select_conversation", "conversation_id": dsh_cid, "store": "dsh"}))
+            loaded = None
+            for _ in range(10):
+                ev = json.loads(await asyncio.wait_for(ws.recv(), timeout=3.0))
+                if ev["type"] == "conversation_loaded" and ev.get("conversation_id") == dsh_cid:
+                    loaded = ev
+                    break
+            assert loaded is not None
+            hist_txt = "\n".join(str(x.get("text") or "") for x in loaded.get("history") or [])
+            assert "验证思考进度和正文保留" in hist_txt and "DSH 已精准回答" in hist_txt
+
+            # 2. Directly route slot to a deleted/unknown plugin store -> MUST error clearly and NEVER invoke agy.exe!
+            bad_slot = pwa._active_slot
+            pwa._slot_meta[bad_slot] = {"conversation_id": "x-1", "title": "bad", "store": "api:deleted_model"}
+            pwa._session_for_slot(bad_slot).linked_store = "api:deleted_model"
+            turns_before = pwa._session_for_slot(bad_slot).num_turns
+            await ws.send(json.dumps({"type": "chat", "client_id": "bad-c2", "text": "不要走agy"}))
+            err_end = None
+            for _ in range(15):
+                ev = json.loads(await asyncio.wait_for(ws.recv(), timeout=3.0))
+                if ev["type"] == "stream_end":
+                    err_end = ev
+                    break
+            assert err_end is not None and "未找到已注册的 AI 代理" in str(err_end["item"].get("text") or "")
+            assert pwa._session_for_slot(bad_slot).num_turns == turns_before
     finally:
         stop_event.set()
         await asyncio.wait_for(srv_task, timeout=5.0)

@@ -35,6 +35,8 @@
       --safe-bot: env(safe-area-inset-bottom, 0px);
       --bot-pad: max(var(--safe-bot), 4px);
       --app-h: 100dvh;
+      --vv-top: 0px;
+      --kb-h: 0px;
       --kb-open: 0;
       --spring-ios: cubic-bezier(0.32, 0.72, 0, 1);
       --spring-pop: cubic-bezier(0.34, 1.48, 0.64, 1);
@@ -63,7 +65,7 @@
       padding: 0;
       width: 100%;
       max-width: 100vw;
-      height: var(--app-h, 100dvh);
+      height: 100%;
       overflow: hidden;
       overscroll-behavior: none;
       background: #000000;
@@ -73,11 +75,14 @@
       text-rendering: optimizeLegibility;
     }
 
-    /* Interactive depth stage wrapper for smooth finger-tracking drawer gesture (strictly <= 100vw!) */
+    /* Interactive depth stage wrapper pinned strictly inside visualViewport (prevents iOS offsetTop blackouts!) */
     .app-stage {
-      position: relative;
+      position: fixed;
+      left: 0;
+      right: 0;
+      top: var(--vv-top, 0px);
       width: 100%;
-      height: 100%;
+      height: var(--app-h, 100dvh);
       display: flex;
       flex-direction: column;
       background: #000000;
@@ -99,7 +104,7 @@
     /* Pure #000000 backing under iOS 26 status-bar blur zone so zero non-black pixels ever get blurred */
     .ios-top-black-guard {
       position: fixed;
-      top: 0;
+      top: var(--vv-top, 0px);
       left: 0;
       right: 0;
       height: var(--top-safe);
@@ -281,7 +286,11 @@
     /* ── Pure-Black Minimalist Sidebar Drawer with Floating Bottom Pills (Screenshot 3) ── */
     .drawer-backdrop {
       position: fixed;
-      inset: 0;
+      top: var(--vv-top, 0px);
+      left: 0;
+      right: 0;
+      height: var(--app-h, 100dvh);
+      bottom: auto;
       background: rgba(0, 0, 0, 0.72);
       backdrop-filter: blur(5px);
       -webkit-backdrop-filter: blur(5px);
@@ -294,9 +303,10 @@
 
     .sidebar-drawer {
       position: fixed;
-      top: 0;
+      top: var(--vv-top, 0px);
       left: 0;
-      bottom: 0;
+      height: var(--app-h, 100dvh);
+      bottom: auto;
       width: min(84vw, 316px);
       max-width: min(84vw, 316px);
       background: #000000;
@@ -410,7 +420,7 @@
       border-radius: 999px;
       padding: 9px 14px 9px 36px;
       color: var(--text-pri);
-      font-size: 15px;
+      font-size: 16px;
       outline: none;
     }
     .drawer-search::placeholder { color: #8e8e93; }
@@ -1868,7 +1878,7 @@
     .plus-popover {
       position: fixed;
       left: 12px;
-      bottom: calc((1 - var(--kb-open, 0)) * var(--safe-bot) + 64px);
+      bottom: calc(var(--kb-h, 0px) + (1 - var(--kb-open, 0)) * var(--safe-bot) + 64px);
       width: 238px;
       background: rgba(26, 26, 32, 0.92);
       backdrop-filter: blur(28px) saturate(180%);
@@ -1921,7 +1931,11 @@
     /* ── Frosted Obsidian Modals & Bottom Sheets ── */
     .overlay {
       position: fixed;
-      inset: 0;
+      top: var(--vv-top, 0px);
+      left: 0;
+      right: 0;
+      height: var(--app-h, 100dvh);
+      bottom: auto;
       background: rgba(0, 0, 0, 0.68);
       backdrop-filter: blur(6px);
       -webkit-backdrop-filter: blur(6px);
@@ -1936,7 +1950,7 @@
     .sheet {
       width: 100%;
       max-width: 640px;
-      max-height: 86dvh;
+      max-height: calc(var(--app-h, 100dvh) - 16px);
       background: rgba(22, 22, 27, 0.96);
       backdrop-filter: blur(32px) saturate(160%);
       -webkit-backdrop-filter: blur(32px) saturate(160%);
@@ -2027,7 +2041,7 @@
       border: 1px solid var(--border-subtle);
       background: #101014;
       color: #fff;
-      font-size: 14px;
+      font-size: 16px;
       outline: none;
     }
     .token-input:focus { border-color: rgba(255, 255, 255, 0.26); }
@@ -2093,7 +2107,7 @@
 
     .toast {
       position: fixed;
-      top: calc(var(--top-safe) + 54px);
+      top: calc(var(--vv-top, 0px) + var(--top-safe) + 54px);
       left: 50%;
       transform: translateX(-50%);
       background: rgba(26, 26, 33, 0.94);
@@ -2282,6 +2296,24 @@
     #deskModal.immersive .screen-frame {
       max-height: none;
       height: 100%;
+    }
+    body.kb-open #deskModal .sheet {
+      padding: 8px 12px 6px;
+      max-height: var(--app-h, 100dvh);
+    }
+    body.kb-open #deskModal .sheet-handle { display: none; }
+    body.kb-open #deskModal .sheet-hdr { margin-bottom: 6px !important; }
+    body.kb-open #deskModal .desk-mode-bar { margin-bottom: 5px; }
+    body.kb-open #deskModal .screen-wrap {
+      flex: 1 1 auto;
+      min-height: 84px;
+      max-height: calc(var(--app-h, 100dvh) - 210px);
+    }
+    body.kb-open #deskModal .screen-frame {
+      max-height: 100%;
+      height: 100%;
+      width: 100%;
+      object-fit: contain;
     }
 
     .desk-mode-bar {
@@ -2710,7 +2742,7 @@
       border-radius: 10px;
       padding: 6px 11px;
       color: #fff;
-      font-size: 14px;
+      font-size: 16px;
       outline: none;
       min-width: 0;
     }
@@ -3187,7 +3219,7 @@
 
       <!-- Direct Mobile-to-PC Unicode Text Input Strip (Zero Clipboard Pollution) -->
       <div id="deskTypeBar" class="desk-type-bar">
-        <input id="deskTypeInput" class="token-input" style="padding:8px 11px;font-size:14px" type="text" placeholder="输入中英文/网址/命令直敲到电脑焦点..." />
+        <input id="deskTypeInput" class="token-input" style="padding:8px 11px;font-size:16px" type="text" placeholder="输入中英文/网址/命令直敲到电脑焦点..." />
         <button type="button" id="deskSendTextBtn" class="pill-btn" style="flex-shrink:0">输入</button>
         <button type="button" id="deskSendTextEnterBtn" class="pill-btn" style="background:#fff;color:#09090b;font-weight:600;flex-shrink:0">输入+↵</button>
       </div>
@@ -3541,37 +3573,42 @@
     const refH = Math.max(window.innerHeight, baselineVvH[orientKey] || 0);
     const kbOpen = (scale <= 1.05 && ((window.innerHeight - vvH) > 110 || (editableFocused && (refH - vvH) > 110))) ? 1 : 0;
 
-    document.documentElement.style.setProperty('--app-h', vvH + 'px');
+    // Anchor all fixed viewports strictly to visualViewport `[vvTop, vvTop + vvH]` via CSS vars
+    const rawTop = (vv && scale <= 1.05) ? Math.round(vv.offsetTop) : 0;
+    const maxTopShift = Math.max(0, window.innerHeight - vvH);
+    const vvTop = Math.max(0, Math.min(rawTop, maxTopShift));
+    const kbH = Math.max(0, window.innerHeight - vvTop - vvH);
 
-    // Compensate iOS WebKit positive `offsetTop` strictly within `[0, innerHeight - vvH]` so `.topbar` never clips above screen
-    // AND `#appStage` bottom NEVER exceeds `window.innerHeight`!
+    const docStyle = document.documentElement.style;
+    docStyle.setProperty('--app-h', vvH + 'px');
+    docStyle.setProperty('--vv-top', vvTop + 'px');
+    docStyle.setProperty('--kb-h', kbH + 'px');
+
     const stg = $('appStage');
-    if (stg) {
-      const maxTopShift = Math.max(0, window.innerHeight - vvH);
-      const rawTop = (vv && scale <= 1.05) ? Math.round(vv.offsetTop) : 0;
-      const stageTop = Math.max(0, Math.min(rawTop, maxTopShift));
-      stg.style.top = stageTop > 0 ? `${stageTop}px` : '';
-    }
+    if (stg && stg.style.top) stg.style.top = '';
 
     if (isIOS && isStandalone && !kbOpen) {
       const physH = isPortrait
         ? Math.max(window.screen.height || 0, window.screen.width || 0)
         : Math.min(window.screen.height || 0, window.screen.width || 0);
       const padPx = (physH > 0 && (physH - vvH) >= 20) ? '2px' : '18px';
-      document.documentElement.style.setProperty('--bot-pad', padPx);
+      docStyle.setProperty('--bot-pad', padPx);
     } else if (kbOpen) {
-      document.documentElement.style.setProperty('--bot-pad', '0px');
+      docStyle.setProperty('--bot-pad', '0px');
     } else {
-      document.documentElement.style.removeProperty('--bot-pad');
+      docStyle.removeProperty('--bot-pad');
     }
 
-    document.documentElement.style.setProperty('--kb-open', String(kbOpen));
+    docStyle.setProperty('--kb-open', String(kbOpen));
     document.body.classList.toggle('kb-open', Boolean(kbOpen));
     if (!editableFocused && window.scrollY !== 0) {
       window.scrollTo(0, 0);
     }
     if (!wasKbOpen && kbOpen && currentMainView === 'home') {
       scrollToBottom(false);
+    }
+    if (wasKbOpen !== kbOpen && $('deskModal') && $('deskModal').classList.contains('show')) {
+      requestAnimationFrame(() => applyDeskStageTransform());
     }
     wasKbOpen = kbOpen;
     updateTabGlider(false);
@@ -3583,6 +3620,16 @@
     }
   }
 
+  function scheduleKeyboardSyncFrames() {
+    while (blurResetTimers.length) clearTimeout(blurResetTimers.pop());
+    scheduleViewportSync();
+    [80, 220, 400].forEach((ms) => {
+      blurResetTimers.push(setTimeout(() => {
+        updateVisualViewport();
+      }, ms));
+    });
+  }
+
   if (window.visualViewport) {
     window.visualViewport.addEventListener('resize', scheduleViewportSync);
     window.visualViewport.addEventListener('scroll', scheduleViewportSync);
@@ -3592,8 +3639,7 @@
 
   document.addEventListener('focusin', (e) => {
     if (isEditableElement(e.target)) {
-      while (blurResetTimers.length) clearTimeout(blurResetTimers.pop());
-      scheduleViewportSync();
+      scheduleKeyboardSyncFrames();
     }
   });
   document.addEventListener('focusout', (e) => {
@@ -7326,7 +7372,7 @@
             <button type="button" id="copyPcClipToPhoneBtn" class="pill-btn">复制到手机</button>
           </div>
         </div>
-        <textarea id="pcClipArea" class="token-input" rows="3" style="font-family:Consolas,monospace;font-size:12.5px;resize:vertical;margin-bottom:8px" placeholder="此处显示电脑剪贴板文本，也可直接输入文字推送到电脑剪贴板..."></textarea>
+        <textarea id="pcClipArea" class="token-input" rows="3" style="font-family:Consolas,monospace;font-size:16px;resize:vertical;margin-bottom:8px" placeholder="此处显示电脑剪贴板文本，也可直接输入文字推送到电脑剪贴板..."></textarea>
         <div style="display:flex;justify-content:flex-end;gap:8px">
           <button type="button" id="quoteClipToChatBtn" class="pill-btn">带入当前对话</button>
           <button type="button" id="pushPcClipBtn" class="pill-btn" style="background:#fff;color:#0d0d0d;font-weight:600">写入电脑剪贴板</button>
@@ -7903,7 +7949,13 @@
     const open = !bar.classList.contains('show');
     bar.classList.toggle('show', open);
     $('deskToggleTypeBtn').classList.toggle('active-act', open);
-    if (open) $('deskTypeInput').focus();
+    if (open) {
+      $('deskTypeInput').focus();
+      scheduleKeyboardSyncFrames();
+    } else {
+      scheduleViewportSync();
+    }
+    requestAnimationFrame(() => applyDeskStageTransform());
   };
 
   function submitDeskDirectText(withEnter = false) {

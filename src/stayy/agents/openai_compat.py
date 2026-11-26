@@ -10,6 +10,7 @@ import logging
 import re
 import socket
 import ssl
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -161,8 +162,11 @@ class _PinnedHttpsConn(http.client.HTTPSConnection):
 
 
 def _safe_session_id(raw: str) -> str:
-    cleaned = re.sub(r"[^A-Za-z0-9_.-]", "_", (raw or "").strip())
-    return cleaned[:96] or f"api-{uuid.uuid4().hex[:12]}"
+    cleaned = re.sub(r"[^A-Za-z0-9_-]", "_", (raw or "").strip()).strip("_")
+    if len(cleaned) < 6:
+        prefix = cleaned or "api"
+        cleaned = f"{prefix}-{uuid.uuid4().hex[:8]}"
+    return cleaned[:80]
 
 
 def api_sessions_dir(runtime_dir: Path, store: str) -> Path:
@@ -284,6 +288,28 @@ async def run_openai_compat_turn(
 
     loop = asyncio.get_running_loop()
     out_q: asyncio.Queue[tuple[str, str]] = asyncio.Queue()
+    conn_lock = threading.Lock()
+    active_conn: list[http.client.HTTPConnection | None] = [None]
+
+    def _close_active_conn() -> None:
+        with conn_lock:
+            c = active_conn[0]
+            active_conn[0] = None
+        if c is not None:
+            try:
+                sock = getattr(c, "sock", None)
+                if sock is not None:
+                    try:
+                        sock.shutdown(socket.SHUT_RDWR)
+                    except OSError:
+                        pass
+                    sock.close()
+            except Exception:
+                pass
+            try:
+                c.close()
+            except Exception:
+                pass
 
     def _worker() -> None:
         conn: http.client.HTTPConnection | None = None
@@ -294,6 +320,15 @@ async def run_openai_compat_turn(
                 if scheme == "https"
                 else _PinnedHttpConn(host, pinned_ips=pinned_ips, port=port, timeout=chunk_timeout_sec)
             )
+            with conn_lock:
+                if cancel_event is not None and cancel_event.is_set():
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+                    loop.call_soon_threadsafe(out_q.put_nowait, ("aborted", ""))
+                    return
+                active_conn[0] = conn
             conn.request("POST", req_path, body=req_body, headers=headers)
             resp = conn.getresponse()
             if 300 <= resp.status < 400:
@@ -348,6 +383,9 @@ async def run_openai_compat_turn(
                 err_txt = err_txt.replace(api_key, "***")
             loop.call_soon_threadsafe(out_q.put_nowait, ("error", f"API 连接异常：{err_txt}"))
         finally:
+            with conn_lock:
+                if active_conn[0] is conn:
+                    active_conn[0] = None
             if conn is not None:
                 try:
                     conn.close()
@@ -365,10 +403,15 @@ async def run_openai_compat_turn(
     while True:
         if cancel_event is not None and cancel_event.is_set():
             was_aborted = True
+            _close_active_conn()
             break
         try:
-            kind, val = await asyncio.wait_for(out_q.get(), timeout=0.4)
+            kind, val = await asyncio.wait_for(out_q.get(), timeout=0.25)
         except asyncio.TimeoutError:
+            if cancel_event is not None and cancel_event.is_set():
+                was_aborted = True
+                _close_active_conn()
+                break
             if worker_task.done():
                 break
             continue
@@ -389,12 +432,27 @@ async def run_openai_compat_turn(
         elif kind == "done":
             break
 
-    await asyncio.gather(worker_task, return_exceptions=True)
+    if cancel_event is not None and cancel_event.is_set():
+        was_aborted = True
+        _close_active_conn()
+    if was_aborted:
+        try:
+            await asyncio.wait_for(asyncio.shield(worker_task), timeout=0.6)
+        except Exception:
+            pass
+    else:
+        await asyncio.gather(worker_task, return_exceptions=True)
 
     if was_aborted:
         return AgentRunResult(ok=False, session_id=sid, aborted=True, error="已中断当前请求")
-    if final_err and not collected_text:
-        return AgentRunResult(ok=False, session_id=sid, error=final_err)
+    if final_err:
+        return AgentRunResult(
+            ok=False,
+            session_id=sid,
+            text="".join(collected_text).strip(),
+            thought="".join(collected_thought).strip(),
+            error=final_err,
+        )
 
     full_text = "".join(collected_text).strip() or "(无文本返回)"
     full_thought = "".join(collected_thought).strip()

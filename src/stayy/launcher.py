@@ -1423,6 +1423,24 @@ class LauncherApp:
         closed_n = int(res.get("closed_clients") or 0)
         new_ep = int(res.get("auth_epoch") or 0)
         self._active_pair_code = ""
+        self._beacon_synced = False
+        self._beacon_pending_nonce = ""
+        if self._ios_pages_url:
+            self._beacon_state = "pushing"
+            try:
+                save_beacon_state(
+                    RUNTIME_DIR,
+                    {
+                        "state": "pushing",
+                        "pages_url": self._ios_pages_url,
+                        "host_id": self._host_id,
+                        "pending_nonce": "",
+                        "pushed": False,
+                        "updated_ms": int(time.time() * 1000),
+                    },
+                )
+            except Exception:
+                pass
         pair_res = self._admin_request("POST", "/admin/pair")
         if pair_res and pair_res.get("ok"):
             self._active_pair_code = str(pair_res.get("code") or "")
@@ -1432,10 +1450,11 @@ class LauncherApp:
             f"✓ 已轮换密钥至第 {new_ep} 代并强制断开 {closed_n} 台在线设备，旧会话已全部失效。",
             "tunnel",
         )
-        if self._ios_pages_url and self._tunnel_url:
+        if self._ios_pages_url:
+            sync_url = self.settings.public_base_url or self._tunnel_url or f"http://{get_lan_ipv4()}:{self.settings.web_pwa_port}"
             threading.Thread(
                 target=self._sync_ios_beacon_worker,
-                args=(self._tunnel_url, self._tunnel_gen),
+                args=(sync_url, self._tunnel_gen),
                 daemon=True,
             ).start()
 
@@ -1649,15 +1668,23 @@ class LauncherApp:
                 state_tip = "正在推送静态壳并读回验真，请稍候..."
             elif self._beacon_state in {"pages_not_ready", "waiting_pages"}:
                 state_tip = "已推送，等待 GitHub Pages 部署生效（旧版或 404 期间不出码）。请确保仓库 Pages 源为 gh-pages 分支。"
+            elif self._beacon_state == "auth_denied":
+                state_tip = "权限受限（HTTP 401/403）：请将目标仓库设为 Public 公开，或在 GitHub Pages 设置页确认已启用 Pages。"
+            elif self._beacon_state == "push_failed":
+                state_tip = "推送 gh-pages 分支失败，请检查本机 Git 登录凭据、仓库写权限或网络连接。"
+            elif self._beacon_state == "decrypt_failed":
+                state_tip = "在线信标与本机当前密钥不匹配（CDN 缓存未刷新或已被其他主机覆写），请点击重新同步。"
+            elif self._beacon_state == "invalid_remote":
+                state_tip = "仓库地址无效或属于受保护上游仓库，请改填您自己名下的 GitHub 仓库 HTTPS 地址。"
             elif self._beacon_state == "host_conflict":
                 state_tip = "冲突：目标 Pages 当前绑定其他主机 host_id，请改用新仓库或同机重置。"
             else:
                 state_tip = "仅发布静态 PWA 壳与加密信标，明文密钥永不入库/不进日志。"
             self._beacon_setup_desc.configure(text=f"{target_line}\n{state_tip}")
             self._beacon_enable_btn.configure(
-                text="同步验真中..." if self._beacon_enabling else ("重新检测/同步" if self._beacon_state == "pages_not_ready" else "一键启用并同步信标")
+                text="同步验真中..." if self._beacon_enabling else ("重新检测/同步" if self._beacon_state in {"pages_not_ready", "auth_denied", "decrypt_failed"} else "一键启用并同步信标")
             )
-            if self._beacon_state in {"pages_not_ready", "waiting_pages"} and cand:
+            if self._beacon_state in {"pages_not_ready", "waiting_pages", "auth_denied"} and cand:
                 if not self._beacon_pages_btn.winfo_ismapped():
                     self._beacon_pages_btn.pack(side=tk.LEFT, padx=(6, 0))
             elif self._beacon_pages_btn.winfo_ismapped():
@@ -2216,14 +2243,15 @@ class LauncherApp:
                 self._enqueue_log("系统", f"{source} 进程已退出（退出码 {code}）。", "warn")
 
     def _sync_ios_beacon_worker(self, tunnel_url: str, tun_gen: int = 0) -> None:
-        if not self._ios_pages_url or not tunnel_url or (tun_gen and tun_gen != self._tunnel_gen):
+        if not self._ios_pages_url or (tun_gen and tun_gen != self._tunnel_gen):
             return
         lan_url = f"http://{get_lan_ipv4()}:{self.settings.web_pwa_port}"
+        eff_tunnel = (tunnel_url or "").strip() or lan_url
         meta: dict[str, Any] = {}
         ok, state_code, info = publish_ios_pwa_and_beacon(
             self.settings.project_dir,
             access_token=self.settings.web_access_token,
-            tunnel_url=tunnel_url,
+            tunnel_url=eff_tunnel,
             lan_url=lan_url,
             host_id=self._host_id,
             beacon_enabled=self.settings.beacon_enabled,
@@ -2249,6 +2277,12 @@ class LauncherApp:
             self._beacon_synced = False
             self._enqueue_log("Tunnel", f"信标未就绪 [{state_code}]：{info}", "warn")
             self._post_ui(self._render_inline_qr)
+            if state_code == "pages_not_ready" and self._beacon_pending_nonce:
+                threading.Thread(
+                    target=self._poll_pending_beacon_verification,
+                    args=(self._ios_pages_url, self._beacon_pending_nonce),
+                    daemon=True,
+                ).start()
 
     def _stop_all_worker(self, include_external: bool) -> None:
         self._desired_running = False

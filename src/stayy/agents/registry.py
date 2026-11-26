@@ -247,7 +247,10 @@ class AgentRegistry:
             )
 
         # 8. Desktop AI Clients (Doubao Desktop, TRAE CN, Gemini Desktop, Grok Bot, WorkBuddy, etc.)
-        self._desktop_apps = discover_desktop_ai_apps(overrides.get("custom_desktop_apps"))
+        self._desktop_apps = discover_desktop_ai_apps(
+            overrides.get("custom_desktop_apps"),
+            local_app_data=self.local_app_data,
+        )
         for app_id, app_info in self._desktop_apps.items():
             specs[f"app:{app_id}"] = AgentSpec(
                 id=app_id,

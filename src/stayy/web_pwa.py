@@ -2117,6 +2117,8 @@ class WebPwaServer:
                 store_mode = ag_spec.store
                 title_label = f"新建 {ag_spec.name} 对话"
                 toast_note = f"已切换至 {ag_spec.name}"
+                if not ag_spec.configured:
+                    toast_note = f"{toast_note}（提示：{ag_spec.description}）"
                 await session.attach_ide_conversation(
                     "",
                     handoff_context="",
@@ -2124,6 +2126,10 @@ class WebPwaServer:
                     title=title_label,
                     store=store_mode,
                 )
+            else:
+                store_mode = "cli"
+                title_label = "新建远程会话"
+                toast_note = f"未找到代理「{req_target}」，已切回随身远程会话"
 
         self._active_slot = new_slot
         self._slot_history[new_slot] = []
@@ -2813,6 +2819,7 @@ class WebPwaServer:
 
         discovered_sid = conv_id
         had_text = {"v": False}
+        thought_state: dict[str, Any] = {"last_emit": 0.0, "buf": []}
 
         async def _cb_session(new_sid: str) -> None:
             nonlocal discovered_sid
@@ -2822,6 +2829,21 @@ class WebPwaServer:
         async def _cb_delta(d: str) -> None:
             had_text["v"] = True
             await on_delta(d)
+
+        async def _cb_thought(chunk: str) -> None:
+            txt = (chunk or "").strip()
+            if not txt:
+                return
+            thought_state["buf"].append(txt)
+            now_t = time.monotonic()
+            if thought_state["last_emit"] == 0.0 or (now_t - thought_state["last_emit"]) >= 1.2:
+                thought_state["last_emit"] = now_t
+                joined = "".join(thought_state["buf"])
+                if len(thought_state["buf"]) > 24:
+                    thought_state["buf"] = [joined[-160:]]
+                last_ln = joined.splitlines()[-1].strip() if joined.splitlines() else joined
+                snippet = (last_ln[-42:] if len(last_ln) > 42 else last_ln) or "分析中"
+                await on_status(f"{spec.name} 深度思考中：{snippet}")
 
         async def _cb_tool(tname: str, detail: str) -> None:
             await on_status(f"{spec.name} 正在调用 {tname}...")
@@ -2845,7 +2867,7 @@ class WebPwaServer:
         cbs = AgentTurnCallbacks(
             on_session=_cb_session,
             on_delta=_cb_delta,
-            on_thought=None,
+            on_thought=_cb_thought,
             on_tool=_cb_tool,
             on_demote_to_thought=_cb_demote,
             on_proc_started=_cb_proc_start,
@@ -3370,9 +3392,17 @@ class WebPwaServer:
                         on_tool=_on_tool,
                         on_status=_on_status,
                     )
-                    if eco_out is not None:
+                    if eco_out is None:
+                        result = TurnResult(
+                            response="",
+                            status="ERROR",
+                            error=f"未找到已注册的 AI 代理：{slot_store}",
+                            conversation_id=slot_cid,
+                            active_model=slot_store,
+                        )
+                    else:
                         result = eco_out
-                        pc_direct_persisted = True
+                        pc_direct_persisted = slot_store not in {"dsh", "copilot"}
                         await self._broadcast(
                             {
                                 "type": "chat_ack",
@@ -3471,7 +3501,10 @@ class WebPwaServer:
                 if ep not in img_paths and is_safe_outbound_file(ep, image_only=True):
                     img_paths.append(ep)
 
-            if not pc_direct_persisted:
+            if pc_direct_persisted:
+                # Turn was written directly into the PC IDE / Codex / WorkBuddy / API transcript — avoid duplicating in `_slot_local_turns`!
+                self._remove_slot_local_turn(chat_slot, client_id)
+            elif slot_store in {"", "cli"}:
                 cli_root = self.cli_store_dir if self.cli_store_dir is not None else _default_cli_dir()
                 harvested = await asyncio.to_thread(
                     harvest_recent_cli_turn_images,
@@ -3482,9 +3515,6 @@ class WebPwaServer:
                 for hp in harvested:
                     if hp not in img_paths:
                         img_paths.append(hp)
-            else:
-                # Turn was written directly into the PC IDE / Codex transcript — avoid duplicating in `_slot_local_turns`!
-                self._remove_slot_local_turn(chat_slot, client_id)
 
             if result.status == "SUCCESS" and not clean_text and not img_paths and not file_paths:
                 clean_text = "已完成。"
@@ -3516,6 +3546,14 @@ class WebPwaServer:
                 "ts": int(time.time() * 1000),
             }
             self._append_slot_history(chat_slot, assistant_entry, persist_local=not pc_direct_persisted)
+            if not pc_direct_persisted and slot_store in {"dsh", "copilot"}:
+                meta_sync = self._slot_meta.get(chat_slot, {})
+                canon_cid = str(result.conversation_id or meta_sync.get("conversation_id") or "")
+                canon_slot = f"{slot_store}:{canon_cid}" if canon_cid else ""
+                if canon_slot and canon_slot != chat_slot:
+                    loc_canon = self._slot_local_turns.setdefault(canon_slot, [])
+                    _extend_deduplicated_turns(loc_canon, list(self._slot_local_turns.get(chat_slot) or []))
+                    self._slot_local_turns[canon_slot] = loc_canon[-100:]
 
             # Atomically check FIFO follow-up queue BEFORE releasing `self._slot_inflight[chat_slot]`!
             fq_after = self._slot_followup_queue.get(chat_slot)
@@ -3962,10 +4000,6 @@ class WebPwaServer:
         admin_srv = await asyncio.start_server(self._handle_admin_http, "127.0.0.1", 0)
         sock_addr = admin_srv.sockets[0].getsockname()
         self.admin_port = int(sock_addr[1])
-        self._admin_state_file = write_admin_state(
-            self.runtime_dir, self.admin_port, self.admin_secret, os.getpid()
-        )
-        logger.info("Stayy loopback admin control plane listening on 127.0.0.1:%d", self.admin_port)
 
         serve_kwargs: dict[str, Any] = {
             "process_request": self._process_request,
@@ -3984,6 +4018,10 @@ class WebPwaServer:
                 self.config.web_pwa_port,
                 **serve_kwargs,
             ):
+                self._admin_state_file = await asyncio.to_thread(
+                    write_admin_state, self.runtime_dir, self.admin_port, self.admin_secret, os.getpid()
+                )
+                logger.info("Stayy loopback admin control plane listening on 127.0.0.1:%d", self.admin_port)
                 if stop_event is not None:
                     await stop_event.wait()
                 else:
@@ -3991,15 +4029,21 @@ class WebPwaServer:
         finally:
             admin_srv.close()
             try:
-                await admin_srv.wait_closed()
+                await asyncio.wait_for(admin_srv.wait_closed(), timeout=1.5)
             except Exception:
                 pass
             cleanup_admin_state(self._admin_state_file)
             async with self._screen_lock:
                 subs_ws = list(self._screen_subs.keys())
             for sws in subs_ws:
-                await self._unsubscribe_live_screen(sws)
+                try:
+                    await asyncio.wait_for(self._unsubscribe_live_screen(sws), timeout=1.0)
+                except Exception:
+                    pass
             for task in list(self._tasks):
                 task.cancel()
             if self._tasks:
-                await asyncio.gather(*self._tasks, return_exceptions=True)
+                try:
+                    await asyncio.wait_for(asyncio.gather(*self._tasks, return_exceptions=True), timeout=2.0)
+                except Exception:
+                    pass

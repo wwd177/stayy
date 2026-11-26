@@ -15,9 +15,28 @@ from .base import CREATE_NO_WINDOW, is_path_safe_no_reparse, is_process_elevated
 APP_ID_RE = re.compile(r"^[a-z0-9_]{2,32}$")
 
 
-def _default_desktop_app_specs() -> list[dict[str, Any]]:
+def _default_desktop_app_specs(local_app_data: Path | None = None) -> list[dict[str, Any]]:
     home = Path.home()
-    local_app = Path(os.getenv("LOCALAPPDATA") or home / "AppData" / "Local")
+    isolated = local_app_data is not None
+    local_app = local_app_data or Path(os.getenv("LOCALAPPDATA") or home / "AppData" / "Local")
+    prog_files = Path(os.getenv("ProgramFiles") or r"C:\Program Files")
+    prog_files_x86 = Path(os.getenv("ProgramFiles(x86)") or r"C:\Program Files (x86)")
+
+    doubao_cands = [local_app / "Doubao" / "Doubao.exe"]
+    if not isolated:
+        doubao_cands = [
+            Path(r"F:\LenovoSoftstore\Install\doubao\Doubao.exe"),
+            *doubao_cands,
+            prog_files / "Doubao" / "Doubao.exe",
+            prog_files_x86 / "Doubao" / "Doubao.exe",
+        ]
+    trae_cands = [local_app / "Programs" / "Trae CN" / "Trae CN.exe"]
+    if not isolated:
+        trae_cands.append(Path(r"F:\LenovoSoftstore\Install\Trae CN\Trae CN.exe"))
+    grok_cands = [local_app / "Programs" / "Grok Bot" / "Grok Bot.exe"]
+    if not isolated:
+        grok_cands.insert(0, Path(r"F:\grok\Grok Bot\Grok Bot.exe"))
+
     return [
         {
             "id": "doubao",
@@ -26,12 +45,7 @@ def _default_desktop_app_specs() -> list[dict[str, Any]]:
             "accent": "#38bdf8",
             "badge": "DB",
             "description": "免 Key 直接唤起豆包电脑窗口，配合 3.2× 光学放大镜远程操作",
-            "candidates": [
-                Path(r"F:\LenovoSoftstore\Install\doubao\Doubao.exe"),
-                local_app / "Doubao" / "Doubao.exe",
-                Path(os.getenv("ProgramFiles") or r"C:\Program Files") / "Doubao" / "Doubao.exe",
-                Path(os.getenv("ProgramFiles(x86)") or r"C:\Program Files (x86)") / "Doubao" / "Doubao.exe",
-            ],
+            "candidates": doubao_cands,
             "process_names": ("doubao.exe",),
         },
         {
@@ -77,10 +91,7 @@ def _default_desktop_app_specs() -> list[dict[str, Any]]:
             "accent": "#22c55e",
             "badge": "TR",
             "description": "打开 TRAE CN AI IDE 桌面端并用放大镜远程继续工作",
-            "candidates": [
-                local_app / "Programs" / "Trae CN" / "Trae CN.exe",
-                Path(r"F:\LenovoSoftstore\Install\Trae CN\Trae CN.exe"),
-            ],
+            "candidates": trae_cands,
             "process_names": ("trae cn.exe",),
         },
         {
@@ -102,10 +113,7 @@ def _default_desktop_app_specs() -> list[dict[str, Any]]:
             "accent": "#f97316",
             "badge": "GK",
             "description": "打开本机 Grok Bot 客户端配合放大镜操控",
-            "candidates": [
-                Path(r"F:\grok\Grok Bot\Grok Bot.exe"),
-                local_app / "Programs" / "Grok Bot" / "Grok Bot.exe",
-            ],
+            "candidates": grok_cands,
             "process_names": ("grok bot.exe",),
         },
         {
@@ -225,12 +233,16 @@ def _focus_window_by_process_win32(process_stem: str) -> bool:
         return False
 
 
-def discover_desktop_ai_apps(custom_apps: list[dict[str, Any]] | None = None) -> dict[str, dict[str, Any]]:
+def discover_desktop_ai_apps(
+    custom_apps: list[dict[str, Any]] | None = None,
+    *,
+    local_app_data: Path | None = None,
+) -> dict[str, dict[str, Any]]:
     """Discover installed local desktop AI clients and snapshot their verified resolved exe paths."""
     running_imgs = _running_process_names_win32()
     catalog: dict[str, dict[str, Any]] = {}
 
-    for item in _default_desktop_app_specs():
+    for item in _default_desktop_app_specs(local_app_data=local_app_data):
         found_exe: Path | None = None
         for cand in item["candidates"]:
             if is_pe_executable_file(cand):
