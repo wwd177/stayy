@@ -227,7 +227,7 @@ def load_beacon_state(runtime_dir: Path) -> dict[str, Any]:
 STATIC_PWA_SW_JS = """\
 const SCOPE_SLUG = new URL(self.registration.scope).pathname.replace(/[^a-zA-Z0-9_-]/g, '_');
 const CACHE_PREFIX = 'stayy-ios-shell-' + SCOPE_SLUG + '-';
-const CACHE_NAME = CACHE_PREFIX + 'v1';
+const CACHE_NAME = CACHE_PREFIX + 'v2';
 const REQUIRED_SHELL = ['./', './index.html'];
 const OPTIONAL_ASSETS = ['./apple-touch-icon.png', './icon-192.png', './icon-512.png', './manifest.json'];
 
