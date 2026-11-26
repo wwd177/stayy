@@ -38,8 +38,15 @@ from typing import Any, Callable
 
 from dotenv import dotenv_values
 
-from .auth import load_or_create_host_id
-from .beacon import publish_ios_pwa_and_beacon, resolve_explicit_beacon_target
+from .auth import atomic_update_env_vars, load_or_create_host_id
+from .beacon import (
+    detect_candidate_beacon_remote,
+    load_beacon_state,
+    publish_ios_pwa_and_beacon,
+    resolve_explicit_beacon_target,
+    save_beacon_state,
+    verify_published_beacon,
+)
 from .conversations import list_local_conversations
 from .maintenance import discover_default_cache_targets, run_safe_cache_cleanup
 from .web_pwa import ensure_web_access_token, get_lan_ipv4
@@ -616,7 +623,16 @@ class LauncherApp:
         )
         self._ios_pages_url: str = gh_info[3] if gh_info else ""
         self._beacon_synced: bool = False
-        self._beacon_state: str = "disabled"
+        saved_bstate = load_beacon_state(RUNTIME_DIR)
+        self._beacon_state: str = str(saved_bstate.get("state") or ("waiting_pages" if self._ios_pages_url else "disabled"))
+        self._beacon_pending_nonce: str = str(saved_bstate.get("pending_nonce") or "")
+        self._beacon_enabling: bool = False
+        self._beacon_candidate = detect_candidate_beacon_remote(settings.project_dir)
+        default_cand_remote = (
+            settings.beacon_git_remote
+            or (self._beacon_candidate[0] if self._beacon_candidate else "")
+        )
+        self._beacon_remote_var = tk.StringVar(value=default_cand_remote)
         self._active_pair_code: str = ""
         self._host_id: str = load_or_create_host_id(RUNTIME_DIR)
         self._qr_mode = tk.StringVar(value="tunnel" if settings.public_base_url else "lan")
@@ -644,6 +660,17 @@ class LauncherApp:
 
         threading.Thread(target=self._refresh_conv_stats_bg, daemon=True).start()
         threading.Thread(target=self._check_firewall_bg, daemon=True).start()
+        if (
+            self.settings.beacon_enabled
+            and self._ios_pages_url
+            and self._beacon_pending_nonce
+            and self._beacon_state in {"pages_not_ready", "waiting_pages"}
+        ):
+            threading.Thread(
+                target=self._poll_pending_beacon_verification,
+                args=(self._ios_pages_url, self._beacon_pending_nonce),
+                daemon=True,
+            ).start()
         self.root.after(160, lambda: self._run_async(self._start_all_worker, False))
 
     def _configure_window(self, *, start_minimized: bool) -> None:
@@ -1030,8 +1057,7 @@ class LauncherApp:
         )
         self.qr_tab_tunnel.pack(side=tk.RIGHT, padx=(3, 0))
         self.qr_tab_lan.pack(side=tk.RIGHT, padx=(3, 0))
-        if self._ios_pages_url and self._beacon_synced:
-            self.qr_tab_ios.pack(side=tk.RIGHT)
+        self.qr_tab_ios.pack(side=tk.RIGHT)
 
         self.qr_img_lbl = tk.Label(
             qr_card,
@@ -1041,6 +1067,61 @@ class LauncherApp:
             pady=4,
         )
         self.qr_img_lbl.pack(pady=(6, 2))
+
+        # Inline setup panel shown inside `📲 永久App` tab until beacon is verified
+        self._beacon_setup_frame = tk.Frame(qr_card, bg=self.QR_SURFACE)
+        self._beacon_setup_title = tk.Label(
+            self._beacon_setup_frame,
+            text="📲 一键启用永久手机 App",
+            bg=self.QR_SURFACE,
+            fg=self.TEXT_PRIMARY,
+            font=("Microsoft YaHei UI", 9, "bold"),
+        )
+        self._beacon_setup_title.pack(anchor="w", pady=(4, 2))
+        self._beacon_setup_desc = tk.Label(
+            self._beacon_setup_frame,
+            text="",
+            bg=self.QR_SURFACE,
+            fg=self.TEXT_SECONDARY,
+            font=("Microsoft YaHei UI", 8),
+            justify=tk.LEFT,
+            wraplength=252,
+        )
+        self._beacon_setup_desc.pack(anchor="w", pady=(0, 5))
+        self._beacon_remote_entry = tk.Entry(
+            self._beacon_setup_frame,
+            textvariable=self._beacon_remote_var,
+            bg="#111111",
+            fg=self.TEXT_PRIMARY,
+            insertbackground=self.TEXT_PRIMARY,
+            relief=tk.FLAT,
+            font=("Consolas", 8),
+        )
+        self._beacon_remote_entry.pack(fill=tk.X, ipady=4, pady=(0, 6))
+        beacon_btn_row = tk.Frame(self._beacon_setup_frame, bg=self.QR_SURFACE)
+        beacon_btn_row.pack(fill=tk.X)
+        self._beacon_enable_btn = self._make_button(
+            beacon_btn_row,
+            text="一键启用并同步信标",
+            command=self._enable_permanent_app_clicked,
+            bg="#10A37F",
+            hover="#0E8F6E",
+            fg="#FFFFFF",
+            padx=10,
+            pady=4,
+            font_size=8,
+        )
+        self._beacon_enable_btn.pack(side=tk.LEFT)
+        self._beacon_pages_btn = self._make_button(
+            beacon_btn_row,
+            text="Pages 设置",
+            command=self._open_pages_settings,
+            bg="#2F2F2F",
+            hover="#3D3D3D",
+            padx=8,
+            pady=4,
+            font_size=8,
+        )
 
         self.qr_url_lbl = tk.Label(
             qr_card,
@@ -1363,9 +1444,13 @@ class LauncherApp:
         mode = self._qr_mode.get()
         pair = self._active_pair_code
         query_suffix = f"?pair={pair}" if pair else f"?token={tok}"
-        if mode == "ios" and self._ios_pages_url and self._beacon_synced:
-            # Fragment `#key=` stays strictly client-side and never enters CDN logs!
-            return f"{self._ios_pages_url}#key={tok}"
+        if mode == "ios":
+            if self.settings.public_base_url:
+                return f"{self.settings.public_base_url.rstrip('/')}/{query_suffix}"
+            if self._ios_pages_url and self._beacon_synced:
+                # Fragment `#key=` stays strictly client-side and never enters CDN logs!
+                return f"{self._ios_pages_url}#key={tok}"
+            return ""
         if mode == "tunnel":
             base = self.settings.public_base_url or self._tunnel_url
             return f"{base.rstrip('/')}/{query_suffix}" if base else ""
@@ -1376,14 +1461,163 @@ class LauncherApp:
         self._qr_mode.set(mode)
         self._render_inline_qr()
 
+    def _open_pages_settings(self) -> None:
+        raw_rem = self._beacon_remote_var.get().strip() or self.settings.beacon_git_remote
+        target = resolve_explicit_beacon_target(
+            self.settings.project_dir,
+            beacon_enabled=True,
+            explicit_remote=raw_rem,
+        )
+        if target:
+            _, owner, repo, _ = target
+            webbrowser.open(f"https://github.com/{owner}/{repo}/settings/pages")
+        else:
+            webbrowser.open("https://github.com/new")
+
+    def _enable_permanent_app_clicked(self) -> None:
+        if self._beacon_enabling:
+            return
+        cand_rem = self._beacon_remote_var.get().strip()
+        target = resolve_explicit_beacon_target(
+            self.settings.project_dir,
+            beacon_enabled=True,
+            explicit_remote=cand_rem,
+        )
+        if target is None:
+            self._beacon_state = "invalid_remote"
+            self._enqueue_log(
+                "Tunnel",
+                "永久 App 未启动：请输入您自己名下的 GitHub 仓库（如 https://github.com/<user>/stayy.git，已拦截受保护上游仓库）。",
+                "warn",
+            )
+            self._render_inline_qr()
+            return
+
+        self._beacon_enabling = True
+        self._beacon_synced = False
+        self._beacon_pending_nonce = ""
+        self._beacon_state = "pushing"
+        self._render_inline_qr()
+        threading.Thread(
+            target=self._enable_permanent_app_worker,
+            args=(cand_rem, target),
+            daemon=True,
+        ).start()
+
+    def _enable_permanent_app_worker(self, explicit_remote: str, target: tuple[str, str, str, str]) -> None:
+        try:
+            remote_url, owner, repo, pages_url = target
+            lan_url = f"http://{get_lan_ipv4()}:{self.settings.web_pwa_port}"
+            tun_url = self.settings.public_base_url or self._tunnel_url or lan_url
+            meta: dict[str, Any] = {}
+            ok, state_code, info = publish_ios_pwa_and_beacon(
+                self.settings.project_dir,
+                access_token=self.settings.web_access_token,
+                tunnel_url=tun_url,
+                lan_url=lan_url,
+                host_id=self._host_id,
+                beacon_enabled=True,
+                explicit_remote=remote_url,
+                beacon_branch=self.settings.beacon_branch,
+                verify_live=True,
+                runtime_dir=RUNTIME_DIR,
+                out_meta=meta,
+            )
+            if meta.get("pushed"):
+                try:
+                    atomic_update_env_vars(
+                        PROJECT_DIR / ".env",
+                        {"BEACON_ENABLED": "true", "BEACON_GIT_REMOTE": remote_url},
+                    )
+                    self.settings.beacon_enabled = True
+                    self.settings.beacon_git_remote = remote_url
+                    self._ios_pages_url = pages_url
+                except Exception as exc:
+                    self._enqueue_log("Tunnel", f"写入永久 App 配置失败：{exc}", "err")
+            self._beacon_pending_nonce = str(meta.get("pending_nonce") or "")
+            self._beacon_state = state_code
+            self._beacon_synced = bool(ok)
+            if ok:
+                self._enqueue_log("Tunnel", f"✓ 永久手机 App 已验真就绪 -> {pages_url}", "tunnel")
+            elif state_code == "pages_not_ready" and self._beacon_pending_nonce:
+                self._enqueue_log(
+                    "Tunnel",
+                    f"已推送到 {owner}/{repo}:{self.settings.beacon_branch}，正在等待 GitHub Pages 构建生效（生效前不出码）...",
+                    "warn",
+                )
+                threading.Thread(
+                    target=self._poll_pending_beacon_verification,
+                    args=(pages_url, self._beacon_pending_nonce),
+                    daemon=True,
+                ).start()
+            else:
+                self._enqueue_log("Tunnel", f"永久 App 同步未就绪 [{state_code}]：{info}", "warn")
+        finally:
+            self._beacon_enabling = False
+            self._post_ui(self._render_inline_qr)
+
+    def _poll_pending_beacon_verification(self, pages_url: str, expected_nonce: str) -> None:
+        for _ in range(12):
+            if self._closing or not expected_nonce or expected_nonce != self._beacon_pending_nonce:
+                return
+            time.sleep(8.0)
+            if self._closing or expected_nonce != self._beacon_pending_nonce:
+                return
+            ok, scode, detail = verify_published_beacon(
+                pages_url,
+                self.settings.web_access_token,
+                self._host_id,
+                expected_nonce,
+                timeout=6.0,
+            )
+            if expected_nonce != self._beacon_pending_nonce:
+                return
+            if ok:
+                self._beacon_synced = True
+                self._beacon_state = "verified"
+                try:
+                    cur = load_beacon_state(RUNTIME_DIR)
+                    cur.update(
+                        {
+                            "state": "verified",
+                            "pages_url": pages_url,
+                            "host_id": self._host_id,
+                            "pending_nonce": expected_nonce,
+                            "updated_ms": int(time.time() * 1000),
+                        }
+                    )
+                    save_beacon_state(RUNTIME_DIR, cur)
+                except Exception:
+                    pass
+                self._enqueue_log("Tunnel", f"✓ GitHub Pages 已正式生效 -> {pages_url}", "tunnel")
+                self._post_ui(self._render_inline_qr)
+                return
+            if scode in {"host_conflict", "auth_denied"}:
+                self._beacon_state = scode
+                self._beacon_synced = False
+                try:
+                    cur = load_beacon_state(RUNTIME_DIR)
+                    cur.update(
+                        {
+                            "state": scode,
+                            "pages_url": pages_url,
+                            "host_id": self._host_id,
+                            "pending_nonce": "",
+                            "updated_ms": int(time.time() * 1000),
+                        }
+                    )
+                    save_beacon_state(RUNTIME_DIR, cur)
+                except Exception:
+                    pass
+                self._enqueue_log("Tunnel", detail if scode == "auth_denied" else "目标 GitHub Pages 与本机 host_id 冲突，已停止等待。", "err")
+                self._post_ui(self._render_inline_qr)
+                return
+
     def _render_inline_qr(self) -> None:
         if self._closing:
             return
-        if self._ios_pages_url and self._beacon_synced:
-            if not self.qr_tab_ios.winfo_ismapped():
-                self.qr_tab_ios.pack(side=tk.RIGHT)
-        elif self.qr_tab_ios.winfo_ismapped():
-            self.qr_tab_ios.pack_forget()
+        if not self.qr_tab_ios.winfo_ismapped():
+            self.qr_tab_ios.pack(side=tk.RIGHT)
 
         m = self._qr_mode.get()
         for btn, active in (
@@ -1395,6 +1629,46 @@ class LauncherApp:
             fg = "#0D0D0D" if active else "#B4B4B4"
             btn._base_bg = bg  # type: ignore[attr-defined]
             btn.configure(bg=bg, fg=fg)
+
+        if m == "ios" and not self.settings.public_base_url and not (self._ios_pages_url and self._beacon_synced):
+            self.qr_img_lbl.pack_forget()
+            if not self._beacon_setup_frame.winfo_ismapped():
+                self._beacon_setup_frame.pack(fill=tk.X, pady=(6, 4))
+
+            cand = resolve_explicit_beacon_target(
+                self.settings.project_dir,
+                beacon_enabled=True,
+                explicit_remote=self._beacon_remote_var.get().strip(),
+            )
+            target_line = (
+                f"目标：{cand[1]}/{cand[2]} ({self.settings.beacon_branch})\n入口：{cand[3]}"
+                if cand
+                else "请填写您自己的 GitHub 仓库 HTTPS 地址（已拒绝覆盖上游保护仓库）"
+            )
+            if self._beacon_state == "pushing" or self._beacon_enabling:
+                state_tip = "正在推送静态壳并读回验真，请稍候..."
+            elif self._beacon_state in {"pages_not_ready", "waiting_pages"}:
+                state_tip = "已推送，等待 GitHub Pages 部署生效（旧版或 404 期间不出码）。请确保仓库 Pages 源为 gh-pages 分支。"
+            elif self._beacon_state == "host_conflict":
+                state_tip = "冲突：目标 Pages 当前绑定其他主机 host_id，请改用新仓库或同机重置。"
+            else:
+                state_tip = "仅发布静态 PWA 壳与加密信标，明文密钥永不入库/不进日志。"
+            self._beacon_setup_desc.configure(text=f"{target_line}\n{state_tip}")
+            self._beacon_enable_btn.configure(
+                text="同步验真中..." if self._beacon_enabling else ("重新检测/同步" if self._beacon_state == "pages_not_ready" else "一键启用并同步信标")
+            )
+            if self._beacon_state in {"pages_not_ready", "waiting_pages"} and cand:
+                if not self._beacon_pages_btn.winfo_ismapped():
+                    self._beacon_pages_btn.pack(side=tk.LEFT, padx=(6, 0))
+            elif self._beacon_pages_btn.winfo_ismapped():
+                self._beacon_pages_btn.pack_forget()
+            self.qr_url_lbl.configure(text="未验真前不显示 #key 永久二维码")
+            return
+
+        if self._beacon_setup_frame.winfo_ismapped():
+            self._beacon_setup_frame.pack_forget()
+        if not self.qr_img_lbl.winfo_ismapped():
+            self.qr_img_lbl.pack(pady=(6, 2), before=self.qr_url_lbl)
 
         target_u = self._current_qr_url()
         if not target_u:
@@ -1417,7 +1691,13 @@ class LauncherApp:
             self._qr_photo_ref.append(photo)
             self.qr_img_lbl.configure(image=photo, text="")
             if m == "ios":
-                self.qr_url_lbl.configure(text="自建信标已验真 (使用 #key 客户端分片)")
+                self.qr_url_lbl.configure(
+                    text=(
+                        "已验真 · 手机扫码 → 分享/菜单 → 添加到主屏幕"
+                        if self._beacon_synced
+                        else "固定公网入口 (一次性配对码)"
+                    )
+                )
             else:
                 masked = target_u.split("?")[0] + (" (一次性配对码)" if self._active_pair_code else "")
                 self.qr_url_lbl.configure(text=masked)
@@ -1425,6 +1705,9 @@ class LauncherApp:
             self.qr_img_lbl.configure(image="", text=f"二维码渲染失败：{exc}")
 
     def _copy_qr_link(self) -> None:
+        if self._qr_mode.get() == "ios" and not self.settings.public_base_url and not self._beacon_synced:
+            self.qr_url_lbl.configure(text="⚠ 请先点击「一键启用并同步信标」并等待验真")
+            return
         # Mint a fresh one-time pairing link when available so repeated copies never collide
         res = self._admin_request("POST", "/admin/pair")
         if res and res.get("ok") and res.get("code"):
@@ -1435,7 +1718,7 @@ class LauncherApp:
         self.root.clipboard_clear()
         self.root.clipboard_append(u)
         self._render_inline_qr()
-        self.qr_url_lbl.configure(text="✓ 已复制一次性配对链接！")
+        self.qr_url_lbl.configure(text="✓ 已复制安装/配对链接！")
 
     def _open_local_browser(self) -> None:
         res = self._admin_request("POST", "/admin/pair")
@@ -1460,12 +1743,19 @@ class LauncherApp:
             items = list_local_conversations(limit=500)
             n_ide = sum(1 for x in items if x.store == "ide")
             n_codex = sum(1 for x in items if x.store == "codex")
+            n_dsh = sum(1 for x in items if x.store == "dsh")
+            n_wb = sum(1 for x in items if x.store == "workbuddy")
             n_cli = sum(1 for x in items if x.store == "cli")
+            n_other = len(items) - n_ide - n_codex - n_dsh - n_wb - n_cli
             parts = [f"Antigravity {n_ide}"]
             if n_codex > 0:
                 parts.append(f"Codex {n_codex}")
-            if n_cli > 0:
-                parts.append(f"远程 {n_cli}")
+            if n_dsh > 0:
+                parts.append(f"DeepSeek {n_dsh}")
+            if n_wb > 0:
+                parts.append(f"WorkBuddy {n_wb}")
+            if n_cli + n_other > 0:
+                parts.append(f"其他 {n_cli + n_other}")
             self._conv_stats_str = f"{' · '.join(parts)}（共 {len(items)}）"
             self._post_ui(
                 lambda: self.engine_detail_lbl.configure(
@@ -1929,6 +2219,7 @@ class LauncherApp:
         if not self._ios_pages_url or not tunnel_url or (tun_gen and tun_gen != self._tunnel_gen):
             return
         lan_url = f"http://{get_lan_ipv4()}:{self.settings.web_pwa_port}"
+        meta: dict[str, Any] = {}
         ok, state_code, info = publish_ios_pwa_and_beacon(
             self.settings.project_dir,
             access_token=self.settings.web_access_token,
@@ -1939,10 +2230,13 @@ class LauncherApp:
             explicit_remote=self.settings.beacon_git_remote,
             beacon_branch=self.settings.beacon_branch,
             verify_live=True,
+            runtime_dir=RUNTIME_DIR,
+            out_meta=meta,
         )
         if tun_gen and tun_gen != self._tunnel_gen:
             return
         self._beacon_state = state_code
+        self._beacon_pending_nonce = str(meta.get("pending_nonce") or self._beacon_pending_nonce)
         if ok:
             self._beacon_synced = True
             self._enqueue_log(

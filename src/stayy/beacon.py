@@ -15,6 +15,7 @@ import hashlib
 import hmac
 import json
 import logging
+import os
 import re
 import secrets
 import shutil
@@ -181,6 +182,46 @@ def resolve_explicit_beacon_target(
         return None
     pages_url = f"https://{owner.lower()}.github.io/{repo}/"
     return (remote_url, owner, repo, pages_url)
+
+
+def detect_candidate_beacon_remote(project_dir: Path) -> tuple[str, str, str, str] | None:
+    """Inspect git `origin` as a *candidate* beacon target for UI preview ONLY.
+
+    Always refuses `PROTECTED_UPSTREAM_REPOS`; NEVER enables `BEACON_ENABLED` implicitly.
+    """
+    return resolve_explicit_beacon_target(
+        project_dir,
+        beacon_enabled=True,
+        explicit_remote="origin",
+        allow_upstream_protected=False,
+    )
+
+
+def save_beacon_state(runtime_dir: Path, state: dict[str, Any]) -> Path:
+    """Persist beacon publish/verification progress into `.runtime/beacon_state.json`."""
+    from .auth import restrict_directory_to_current_user, restrict_file_to_current_user
+
+    restrict_directory_to_current_user(runtime_dir)
+    state_file = runtime_dir / "beacon_state.json"
+    tmp = state_file.with_name(f".beacon_state.{secrets.token_hex(4)}.tmp")
+    tmp.write_text("", encoding="utf-8")
+    restrict_file_to_current_user(tmp)
+    tmp.write_text(json.dumps(state, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    os.replace(tmp, state_file)
+    restrict_file_to_current_user(state_file)
+    return state_file
+
+
+def load_beacon_state(runtime_dir: Path) -> dict[str, Any]:
+    """Load persisted `.runtime/beacon_state.json` if present, returning empty dict otherwise."""
+    state_file = runtime_dir / "beacon_state.json"
+    if not state_file.is_file():
+        return {}
+    try:
+        data = json.loads(state_file.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
 
 
 STATIC_PWA_SW_JS = """\
@@ -373,6 +414,8 @@ def verify_published_beacon(
                 return False, "pages_not_ready", f"Pages 返回状态 {resp.status}"
             env_data = json.loads(resp.read(65536).decode("utf-8"))
     except urllib.error.HTTPError as exc:
+        if exc.code in {401, 403}:
+            return False, "auth_denied", f"GitHub Pages 访问受限（HTTP {exc.code}，请确认仓库公开且 Pages 已启用）"
         return False, "pages_not_ready", f"GitHub Pages 尚未生效（HTTP {exc.code}）"
     except Exception as exc:
         return False, "pages_not_ready", f"无法读回在线信标：{exc}"
@@ -401,6 +444,8 @@ def publish_ios_pwa_and_beacon(
     explicit_remote: str,
     beacon_branch: str = "gh-pages",
     verify_live: bool = True,
+    runtime_dir: Path | None = None,
+    out_meta: dict[str, Any] | None = None,
 ) -> tuple[bool, str, str]:
     """Build and push static PWA + encrypted `beacon.json` ONLY when explicitly enabled for a user-owned remote.
 
@@ -419,12 +464,34 @@ def publish_ios_pwa_and_beacon(
     stage_dir = project_dir / ".gh_pages_stage"
     extra = {"creationflags": CREATE_NO_WINDOW} if sys.platform == "win32" else {}
 
+    def _record_state(state_code: str, nonce_val: str = "", pushed: bool = False) -> None:
+        snap = {
+            "state": state_code,
+            "target_remote": remote_url,
+            "owner": owner,
+            "repo": repo,
+            "branch": clean_branch,
+            "pages_url": pages_url,
+            "host_id": host_id,
+            "pending_nonce": nonce_val,
+            "pushed": pushed,
+            "updated_ms": int(time.time() * 1000),
+        }
+        if out_meta is not None:
+            out_meta.update(snap)
+        if runtime_dir is not None:
+            try:
+                save_beacon_state(runtime_dir, snap)
+            except Exception as exc:
+                logger.debug("save_beacon_state warning: %s", exc)
+
     with _BEACON_PUBLISH_LOCK:
         if verify_live:
             pre_ok, pre_state, pre_detail = verify_published_beacon(
                 pages_url, access_token, host_id, expected_nonce="__precheck__", timeout=4.0
             )
             if not pre_ok and pre_state == "host_conflict":
+                _record_state("host_conflict")
                 return (False, "host_conflict", pre_detail)
         try:
             if stage_dir.exists():
@@ -456,6 +523,7 @@ def publish_ios_pwa_and_beacon(
 
             init_res = _git("init", "-b", clean_branch)
             if init_res.returncode != 0:
+                _record_state("push_failed")
                 return (
                     False,
                     "push_failed",
@@ -476,6 +544,7 @@ def publish_ios_pwa_and_beacon(
                 "icon-512.png",
             )
             if add_res.returncode != 0:
+                _record_state("push_failed")
                 return (
                     False,
                     "push_failed",
@@ -484,14 +553,20 @@ def publish_ios_pwa_and_beacon(
 
             c_res = _git("commit", "-m", "chore(pwa): sync encrypted Stayy beacon")
             if c_res.returncode != 0:
+                _record_state("push_failed")
                 return (
                     False,
                     "push_failed",
                     f"生成信标提交失败：{(c_res.stderr or c_res.stdout).strip()[:120]}",
                 )
 
+            _record_state("pushing", pub_nonce, pushed=False)
             p_res = _git("push", "-f", remote_url, f"HEAD:{clean_branch}", timeout=30)
+            if p_res.returncode != 0 and sys.platform == "win32":
+                # Transient Windows schannel retry
+                p_res = _git("-c", "http.sslBackend=openssl", "push", "-f", remote_url, f"HEAD:{clean_branch}", timeout=30)
             if p_res.returncode != 0:
+                _record_state("push_failed", pub_nonce, pushed=False)
                 return (
                     False,
                     "push_failed",
@@ -503,8 +578,11 @@ def publish_ios_pwa_and_beacon(
                     pages_url, access_token, host_id, pub_nonce
                 )
                 if not ok_live:
+                    _record_state(state_code, pub_nonce, pushed=True)
                     return (False, state_code, detail)
 
+            _record_state("verified", pub_nonce, pushed=True)
             return (True, "verified", pages_url)
         except Exception as exc:
+            _record_state("push_failed")
             return (False, "push_failed", f"同步永久入口异常：{exc}")

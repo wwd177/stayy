@@ -72,6 +72,369 @@ def _default_codex_dir() -> Path:
     return Path.home() / ".codex"
 
 
+def _default_dsh_dir() -> Path:
+    return Path.home() / ".dsh"
+
+
+def _default_workbuddy_dir() -> Path:
+    return Path.home() / ".workbuddy"
+
+
+def _default_copilot_dir() -> Path:
+    return Path.home() / ".copilot"
+
+
+def _safe_stat_mtime_ms(p: Path) -> int:
+    try:
+        return int(p.stat().st_mtime * 1000)
+    except OSError:
+        return 0
+
+
+def _query_dsh_store(dsh_root: Path, limit: int = 200) -> list[ConversationItem]:
+    """Read-only parser for DeepSeek Harness `~/.dsh/storages/session_projcache/sessions/*.json`."""
+    pc_dir = dsh_root / "storages" / "session_projcache" / "sessions"
+    if not pc_dir.is_dir():
+        return []
+    items: list[ConversationItem] = []
+    for jf in sorted(pc_dir.glob("*.json"), key=_safe_mtime, reverse=True):
+        cid = jf.stem.strip()
+        if not SAFE_CONV_ID_RE.match(cid):
+            continue
+        try:
+            raw = json.loads(jf.read_text(encoding="utf-8", errors="replace"))
+        except Exception:
+            continue
+        rec = raw.get("record") if isinstance(raw, dict) else None
+        if not isinstance(rec, dict):
+            continue
+        ident = rec.get("identity") or {}
+        rows = rec.get("rows") or {}
+        ws = _clean_win_path(str(ident.get("cwd") or ""))
+        title_obj = rows.get("title") or {}
+        title_str = str(title_obj.get("val") if isinstance(title_obj, dict) else title_obj or "").strip()
+        title = _clean_display_title(title_str, 54) or f"DSH 会话 {cid[-8:]}"
+        ts_ms = max(int(ident.get("createdAt") or 0), _safe_stat_mtime_ms(jf))
+        outline = rows.get("turnOutline")
+        step_cnt = len(outline) if isinstance(outline, (list, dict)) else 0
+        items.append(
+            ConversationItem(
+                conversation_id=cid,
+                title=title,
+                preview=title,
+                store="dsh",
+                source_label="DeepSeek Harness",
+                step_count=step_cnt,
+                updated_ms=ts_ms,
+                updated_human=_format_relative_time(ts_ms),
+                workspace=ws,
+                running=False,
+            )
+        )
+        if len(items) >= limit:
+            break
+    return items
+
+
+def _load_dsh_detail(cid: str, dsh_root: Path, max_messages: int = 200) -> ConversationDetail | None:
+    jf = dsh_root / "storages" / "session_projcache" / "sessions" / f"{cid}.json"
+    if not jf.is_file():
+        return None
+    try:
+        raw = json.loads(jf.read_text(encoding="utf-8", errors="replace"))
+    except Exception:
+        return None
+    rec = raw.get("record") if isinstance(raw, dict) else None
+    if not isinstance(rec, dict):
+        return None
+    ident = rec.get("identity") or {}
+    rows = rec.get("rows") or {}
+    ws = _clean_win_path(str(ident.get("cwd") or ""))
+    title_obj = rows.get("title") or {}
+    title_str = str(title_obj.get("val") if isinstance(title_obj, dict) else title_obj or "").strip()
+    title = _clean_display_title(title_str, 60) or f"DeepSeek Harness {cid[-8:]}"
+
+    msgs: list[ChatMessage] = []
+    outline = rows.get("turnOutline")
+    outline_entries = (
+        outline.values()
+        if isinstance(outline, dict)
+        else (outline if isinstance(outline, list) else [])
+    )
+    for entry in outline_entries:
+        if not isinstance(entry, dict):
+            continue
+        prompt_t = str(entry.get("prompt") or entry.get("userPrompt") or entry.get("title") or "").strip()
+        ans_t = str(entry.get("summary") or entry.get("answer") or entry.get("response") or "").strip()
+        ts = int(entry.get("ts") or entry.get("createdAt") or ident.get("createdAt") or 0)
+        if prompt_t:
+            msgs.append(ChatMessage(role="user", text=prompt_t, ts_ms=ts))
+        if ans_t:
+            msgs.append(ChatMessage(role="assistant", text=ans_t, ts_ms=ts))
+
+    if not msgs:
+        msgs.append(
+            ChatMessage(
+                role="assistant",
+                text=f"DeepSeek Harness 会话 `{cid}` 已索引（历史正文以压缩归档存储）。发送下一条消息将通过 `--session-id {cid}` 直接续接原上下文。",
+                ts_ms=int(ident.get("createdAt") or _safe_stat_mtime_ms(jf)),
+            )
+        )
+
+    sliced = msgs[-max_messages:]
+    return ConversationDetail(
+        conversation_id=cid,
+        title=title,
+        store="dsh",
+        workspace=ws,
+        running=False,
+        messages=sliced,
+        total_messages=len(msgs),
+        has_more=len(msgs) > len(sliced),
+    )
+
+
+def _extract_wb_text(content: Any) -> str:
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, list):
+        parts: list[str] = []
+        for b in content:
+            if isinstance(b, dict):
+                bt = str(b.get("type") or "")
+                if bt in {"input_text", "output_text", "text"} and b.get("text"):
+                    parts.append(str(b["text"]).strip())
+        return "\n".join(p for p in parts if p).strip()
+    return ""
+
+
+def _decode_wb_project_dirname(dirname: str) -> str:
+    # WorkBuddy encodes `c:\Users\foo\bar` as `c-Users-foo-bar`; prefer inner cwd from JSONL lines when available
+    if len(dirname) >= 3 and dirname[1] == "-":
+        return dirname[0].upper() + ":\\" + dirname[2:].replace("-", "\\")
+    return ""
+
+
+def _query_workbuddy_store(wb_root: Path, limit: int = 200) -> list[ConversationItem]:
+    """Read-only parser for WorkBuddy `~/.workbuddy/projects/<ws>/<sid>.jsonl`."""
+    proj_root = wb_root / "projects"
+    if not proj_root.is_dir():
+        return []
+    files = sorted(proj_root.rglob("*.jsonl"), key=_safe_mtime, reverse=True)
+    items: list[ConversationItem] = []
+    seen: set[str] = set()
+    for jf in files:
+        cid = jf.stem.strip()
+        if not SAFE_CONV_ID_RE.match(cid) or cid in seen:
+            continue
+        seen.add(cid)
+        title = ""
+        ws = _decode_wb_project_dirname(jf.parent.name)
+        ts_ms = _safe_stat_mtime_ms(jf)
+        step_cnt = 0
+        try:
+            with jf.open("r", encoding="utf-8", errors="replace") as fh:
+                for idx, line in enumerate(fh):
+                    if idx > 80 and title:
+                        break
+                    try:
+                        obj = json.loads(line)
+                    except Exception:
+                        continue
+                    if not isinstance(obj, dict) or obj.get("type") != "message":
+                        continue
+                    step_cnt += 1
+                    if obj.get("cwd"):
+                        ws = _clean_win_path(str(obj["cwd"]))
+                    if obj.get("role") == "user" and not title:
+                        txt = _extract_wb_text(obj.get("content"))
+                        if txt:
+                            title = _clean_display_title(txt, 54)
+        except Exception:
+            continue
+        title = title or f"WorkBuddy {cid[:8]}"
+        items.append(
+            ConversationItem(
+                conversation_id=cid,
+                title=title,
+                preview=title,
+                store="workbuddy",
+                source_label="WorkBuddy",
+                step_count=step_cnt,
+                updated_ms=ts_ms,
+                updated_human=_format_relative_time(ts_ms),
+                workspace=ws,
+                running=False,
+            )
+        )
+        if len(items) >= limit:
+            break
+    return items
+
+
+def _load_workbuddy_detail(cid: str, wb_root: Path, max_messages: int = 200) -> ConversationDetail | None:
+    proj_root = wb_root / "projects"
+    if not proj_root.is_dir():
+        return None
+    matches = sorted(proj_root.rglob(f"{cid}.jsonl"), key=_safe_mtime, reverse=True)
+    if not matches:
+        return None
+    jf = matches[0]
+    ws = _decode_wb_project_dirname(jf.parent.name)
+    msgs: list[ChatMessage] = []
+    try:
+        with jf.open("r", encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                try:
+                    obj = json.loads(line)
+                except Exception:
+                    continue
+                if not isinstance(obj, dict) or obj.get("type") != "message":
+                    continue
+                if obj.get("cwd"):
+                    ws = _clean_win_path(str(obj["cwd"]))
+                role = str(obj.get("role") or "")
+                if role not in {"user", "assistant"}:
+                    continue
+                txt = _extract_wb_text(obj.get("content"))
+                if not txt:
+                    continue
+                ts = int(obj.get("timestamp") or 0)
+                msgs.append(ChatMessage(role=role, text=txt, ts_ms=ts))
+    except Exception:
+        return None
+
+    first_user = next((m.text for m in msgs if m.role == "user"), "")
+    title = _clean_display_title(first_user, 60) or f"WorkBuddy {cid[:8]}"
+    sliced = msgs[-max_messages:]
+    return ConversationDetail(
+        conversation_id=cid,
+        title=title,
+        store="workbuddy",
+        workspace=ws,
+        running=False,
+        messages=sliced,
+        total_messages=len(msgs),
+        has_more=len(msgs) > len(sliced),
+    )
+
+
+def _query_copilot_store(copilot_root: Path, limit: int = 100) -> list[ConversationItem]:
+    """Read-only scanner for GitHub Copilot CLI session folders."""
+    items: list[ConversationItem] = []
+    seen: set[str] = set()
+    chats_dir = copilot_root / "chats"
+    if chats_dir.is_dir():
+        cand_dirs = [p for p in chats_dir.glob("*/*") if p.is_dir()]
+        for d in sorted(cand_dirs, key=_safe_mtime, reverse=True):
+            cid = d.name.strip()
+            if not SAFE_CONV_ID_RE.match(cid) or cid in seen:
+                continue
+            seen.add(cid)
+            ts_ms = _safe_stat_mtime_ms(d)
+            items.append(
+                ConversationItem(
+                    conversation_id=cid,
+                    title=cid.replace("-", " "),
+                    preview=f"Copilot 会话 · {d.parent.name}",
+                    store="copilot",
+                    source_label="Copilot CLI",
+                    step_count=0,
+                    updated_ms=ts_ms,
+                    updated_human=_format_relative_time(ts_ms),
+                    workspace="",
+                    running=False,
+                )
+            )
+            if len(items) >= limit:
+                break
+    return items
+
+
+def _query_api_sessions_store(api_root: Path, limit: int = 120) -> list[ConversationItem]:
+    """Load persisted OpenAI-compatible API session metadata from `.runtime/api_sessions/`."""
+    if not api_root.is_dir():
+        return []
+    label_map = {
+        "doubao_api": "豆包 Ark",
+        "deepseek_api": "DeepSeek API",
+        "ollama": "本机 Ollama",
+    }
+    items: list[ConversationItem] = []
+    for jf in sorted(api_root.rglob("*.json"), key=_safe_mtime, reverse=True):
+        if jf.name.startswith("."):
+            continue
+        try:
+            data = json.loads(jf.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if not isinstance(data, dict):
+            continue
+        cid = str(data.get("session_id") or jf.stem).strip()
+        store = str(data.get("store") or jf.parent.name).strip()
+        if not SAFE_CONV_ID_RE.match(cid):
+            continue
+        msgs = data.get("messages") or []
+        last_txt = str(msgs[-1].get("text") or "") if msgs and isinstance(msgs[-1], dict) else ""
+        ts_ms = int(data.get("updated_ms") or _safe_stat_mtime_ms(jf))
+        items.append(
+            ConversationItem(
+                conversation_id=cid,
+                title=str(data.get("title") or cid)[:54],
+                preview=last_txt.splitlines()[0][:80] if last_txt else "API 对话",
+                store=store,
+                source_label=label_map.get(store, store),
+                step_count=len(msgs),
+                updated_ms=ts_ms,
+                updated_human=_format_relative_time(ts_ms),
+                workspace=str(data.get("workspace") or ""),
+                running=False,
+            )
+        )
+        if len(items) >= limit:
+            break
+    return items
+
+
+def _load_api_session_detail(cid: str, store: str, api_root: Path, max_messages: int = 200) -> ConversationDetail | None:
+    cand = api_root / re.sub(r"[^A-Za-z0-9_.-]", "_", store or "") / f"{cid}.json"
+    if not cand.is_file():
+        matches = list(api_root.rglob(f"{cid}.json"))
+        cand = matches[0] if matches else Path("__missing__")
+    if not cand.is_file():
+        return None
+    try:
+        data = json.loads(cand.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    raw_msgs = data.get("messages") if isinstance(data, dict) else []
+    msgs: list[ChatMessage] = []
+    for m in raw_msgs or []:
+        if not isinstance(m, dict):
+            continue
+        role = str(m.get("role") or "")
+        txt = str(m.get("text") or "").strip()
+        if role in {"user", "assistant"} and txt:
+            msgs.append(
+                ChatMessage(
+                    role=role,
+                    text=txt,
+                    ts_ms=int(m.get("ts") or 0),
+                )
+            )
+    sliced = msgs[-max_messages:]
+    return ConversationDetail(
+        conversation_id=cid,
+        title=str(data.get("title") or cid),
+        store=str(data.get("store") or store),
+        workspace=str(data.get("workspace") or ""),
+        running=False,
+        messages=sliced,
+        total_messages=len(msgs),
+        has_more=len(msgs) > len(sliced),
+    )
+
+
 def _parse_iso_to_ms(raw: str) -> int:
     s = (raw or "").strip()
     if not s or s.startswith("0001-01-01"):
@@ -701,17 +1064,22 @@ def list_local_conversations(
     ide_dir: Path | None = None,
     cli_dir: Path | None = None,
     codex_dir: Path | None = None,
+    dsh_dir: Path | None = None,
+    workbuddy_dir: Path | None = None,
+    copilot_dir: Path | None = None,
+    api_sessions_dir: Path | None = None,
 ) -> list[ConversationItem]:
-    """Return merged, recency-sorted conversations across PC Antigravity IDE, PC Codex Desktop, and Remote CLI."""
+    """Return merged, recency-sorted conversations across Antigravity, Codex, DSH, WorkBuddy, Copilot & API stores."""
     ide_root = ide_dir if ide_dir is not None else _default_ide_dir()
     cli_root = cli_dir if cli_dir is not None else _default_cli_dir()
-    # When custom test directories are passed without codex_dir, isolate from real ~/.codex
-    if codex_dir is not None:
-        codex_root: Path | None = codex_dir
-    elif ide_dir is None and cli_dir is None:
-        codex_root = _default_codex_dir()
-    else:
-        codex_root = None
+    isolated_test = ide_dir is not None or cli_dir is not None
+    # When custom test directories are passed without optional dirs, isolate from real host home
+    codex_root: Path | None = codex_dir if codex_dir is not None else (None if isolated_test else _default_codex_dir())
+    dsh_root: Path | None = dsh_dir if dsh_dir is not None else (None if isolated_test else _default_dsh_dir())
+    wb_root: Path | None = workbuddy_dir if workbuddy_dir is not None else (None if isolated_test else _default_workbuddy_dir())
+    cop_root: Path | None = copilot_dir if copilot_dir is not None else (None if isolated_test else _default_copilot_dir())
+    default_api = Path(__file__).resolve().parents[2] / ".runtime" / "api_sessions"
+    api_root: Path | None = api_sessions_dir if api_sessions_dir is not None else (None if isolated_test else default_api)
 
     merged: dict[str, ConversationItem] = {}
 
@@ -726,6 +1094,22 @@ def list_local_conversations(
     if codex_root is not None:
         for it in _query_codex_store(codex_root, limit):
             merged[f"codex:{it.conversation_id}" if it.conversation_id in merged else it.conversation_id] = it
+
+    if dsh_root is not None:
+        for it in _query_dsh_store(dsh_root, limit):
+            merged[f"dsh:{it.conversation_id}" if it.conversation_id in merged else it.conversation_id] = it
+
+    if wb_root is not None:
+        for it in _query_workbuddy_store(wb_root, limit):
+            merged[f"workbuddy:{it.conversation_id}" if it.conversation_id in merged else it.conversation_id] = it
+
+    if cop_root is not None:
+        for it in _query_copilot_store(cop_root, min(limit, 80)):
+            merged[f"copilot:{it.conversation_id}" if it.conversation_id in merged else it.conversation_id] = it
+
+    if api_root is not None:
+        for it in _query_api_sessions_store(api_root, min(limit, 120)):
+            merged[f"{it.store}:{it.conversation_id}"] = it
 
     ordered = sorted(merged.values(), key=lambda x: x.updated_ms, reverse=True)
     return ordered[:limit]
@@ -963,6 +1347,10 @@ def load_conversation_detail(
     ide_dir: Path | None = None,
     cli_dir: Path | None = None,
     codex_dir: Path | None = None,
+    dsh_dir: Path | None = None,
+    workbuddy_dir: Path | None = None,
+    copilot_dir: Path | None = None,
+    api_sessions_dir: Path | None = None,
 ) -> ConversationDetail | None:
     """Load clean human-readable chat history (user + assistant turns & images) for any local store."""
     cid = (conversation_id or "").strip().removeprefix("codex:")
@@ -972,9 +1360,35 @@ def load_conversation_detail(
     ide_root = ide_dir if ide_dir is not None else _default_ide_dir()
     cli_root = cli_dir if cli_dir is not None else _default_cli_dir()
     codex_root = codex_dir if codex_dir is not None else _default_codex_dir()
+    dsh_root = dsh_dir if dsh_dir is not None else _default_dsh_dir()
+    wb_root = workbuddy_dir if workbuddy_dir is not None else _default_workbuddy_dir()
+    cop_root = copilot_dir if copilot_dir is not None else _default_copilot_dir()
+    api_root = api_sessions_dir if api_sessions_dir is not None else (Path(__file__).resolve().parents[2] / ".runtime" / "api_sessions")
 
     if store == "codex":
         return _load_codex_detail(cid, codex_root, max_messages)
+    if store == "dsh":
+        return _load_dsh_detail(cid, dsh_root, max_messages)
+    if store == "workbuddy":
+        return _load_workbuddy_detail(cid, wb_root, max_messages)
+    if store == "copilot":
+        return ConversationDetail(
+            conversation_id=cid,
+            title=f"Copilot {cid[:12]}",
+            store="copilot",
+            workspace="",
+            running=False,
+            messages=[
+                ChatMessage(
+                    role="assistant",
+                    text=f"GitHub Copilot CLI 会话 `{cid}` 已索引。发送消息将通过 `--resume={cid}` 在只读安全工具策略下续聊。",
+                )
+            ],
+            total_messages=1,
+            has_more=False,
+        )
+    if store in {"doubao_api", "deepseek_api", "ollama"} or store.startswith("api:"):
+        return _load_api_session_detail(cid, store, api_root, max_messages)
 
     # Check both stores with preference matching requested `store`, ALWAYS falling back to the other store
     # so cross-store IDs never return empty!
@@ -1289,6 +1703,7 @@ def list_recent_workspaces(
     cli_dir: Path | None = None,
     codex_dir: Path | None = None,
     limit: int = 12,
+    preloaded_items: list[ConversationItem] | None = None,
 ) -> list[str]:
     """Collect recent existing workspace directories across Antigravity + Codex for quick project selection."""
     seen: list[str] = []
@@ -1304,7 +1719,12 @@ def list_recent_workspaces(
             pass
 
     _add(str(default_workspace))
-    for item in list_local_conversations(limit=80, ide_dir=ide_dir, cli_dir=cli_dir, codex_dir=codex_dir):
+    items_iter = (
+        preloaded_items
+        if preloaded_items is not None
+        else list_local_conversations(limit=80, ide_dir=ide_dir, cli_dir=cli_dir, codex_dir=codex_dir)
+    )
+    for item in items_iter:
         if item.workspace:
             _add(item.workspace)
 

@@ -2,6 +2,7 @@
 .env
 .env.*
 !.env.example
+agents.local.json
 .launcher_ui.json
 .continuation_map.json
 .gh_pages_stage/

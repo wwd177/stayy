@@ -22,23 +22,23 @@ logger = logging.getLogger(__name__)
 CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
 
 
-def atomic_write_env_token(env_path: Path, new_token: str) -> None:
-    """Atomically persist `WEB_ACCESS_TOKEN=<new_token>` to `env_path` using temp-file + `os.replace`."""
+def atomic_update_env_vars(env_path: Path, updates: dict[str, str]) -> None:
+    """Atomically upsert key=value entries in `env_path` using temp-file + `os.replace`."""
     env_path.parent.mkdir(parents=True, exist_ok=True)
-    if env_path.is_file():
-        raw = env_path.read_text(encoding="utf-8")
-        lines = raw.splitlines()
-    else:
-        lines = []
+    raw = env_path.read_text(encoding="utf-8") if env_path.is_file() else ""
+    lines = raw.splitlines()
+    remaining = dict(updates)
 
-    replaced = False
     for idx, line in enumerate(lines):
-        if line.strip().startswith("WEB_ACCESS_TOKEN="):
-            lines[idx] = f"WEB_ACCESS_TOKEN={new_token}"
-            replaced = True
-            break
-    if not replaced:
-        lines.append(f"WEB_ACCESS_TOKEN={new_token}")
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or "=" not in stripped:
+            continue
+        key = stripped.split("=", 1)[0].strip()
+        if key in remaining:
+            lines[idx] = f"{key}={remaining.pop(key)}"
+
+    for key, val in remaining.items():
+        lines.append(f"{key}={val}")
 
     content = "\n".join(lines) + "\n"
     tmp_path = env_path.with_name(f".{env_path.name}.{secrets.token_hex(6)}.tmp")
@@ -57,6 +57,11 @@ def atomic_write_env_token(env_path: Path, new_token: str) -> None:
         except OSError:
             pass
         raise
+
+
+def atomic_write_env_token(env_path: Path, new_token: str) -> None:
+    """Atomically persist `WEB_ACCESS_TOKEN=<new_token>` to `env_path` using temp-file + `os.replace`."""
+    atomic_update_env_vars(env_path, {"WEB_ACCESS_TOKEN": new_token})
 
 
 def load_or_create_host_id(runtime_dir: Path) -> str:

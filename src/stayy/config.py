@@ -93,6 +93,17 @@ class BridgeConfig:
     trust_cf_proxy_headers: bool = False
     bark_push_url: str = ""
     bark_allow_private_host: bool = False
+    # Multi-Agent ecosystem security & optional API provider configuration
+    stayy_allow_agent_write: bool = False
+    stayy_allow_local_llm_ports: tuple[int, ...] = (11434, 1234)
+    deepseek_api_key: str = ""
+    deepseek_base_url: str = "https://api.deepseek.com/v1"
+    deepseek_model: str = "deepseek-chat"
+    doubao_ark_api_key: str = ""
+    doubao_ark_base_url: str = "https://ark.cn-beijing.volces.com/api/v3"
+    doubao_ark_model: str = ""
+    ollama_model: str = ""
+    ollama_base_url: str = "http://127.0.0.1:11434/v1"
 
     def build_session_instructions(self) -> str:
         """Combine persona prompt and latest persistent user memory (re-read fresh per new session)."""
@@ -210,4 +221,19 @@ class BridgeConfig:
             trust_cf_proxy_headers=_parse_bool(_get("TRUST_CF_PROXY_HEADERS"), False),
             bark_push_url=(_get("BARK_PUSH_URL") or "").strip(),
             bark_allow_private_host=_parse_bool(_get("BARK_ALLOW_PRIVATE_HOST"), False),
+            stayy_allow_agent_write=_parse_bool(_get("STAYY_ALLOW_AGENT_WRITE"), False),
+            stayy_allow_local_llm_ports=tuple(
+                int(p)
+                for p in _parse_csv(_get("STAYY_ALLOW_LOCAL_LLM_PORTS") or "11434,1234")
+                if p.isdigit() and 1 <= int(p) <= 65535
+            )
+            or (11434, 1234),
+            deepseek_api_key=(_get("DEEPSEEK_API_KEY") or "").strip(),
+            deepseek_base_url=(_get("DEEPSEEK_BASE_URL") or "https://api.deepseek.com/v1").strip().rstrip("/"),
+            deepseek_model=(_get("DEEPSEEK_MODEL") or "deepseek-chat").strip() or "deepseek-chat",
+            doubao_ark_api_key=(_get("DOUBAO_ARK_API_KEY") or "").strip(),
+            doubao_ark_base_url=(_get("DOUBAO_ARK_BASE_URL") or "https://ark.cn-beijing.volces.com/api/v3").strip().rstrip("/"),
+            doubao_ark_model=(_get("DOUBAO_ARK_MODEL") or "").strip(),
+            ollama_model=(_get("OLLAMA_MODEL") or "").strip(),
+            ollama_base_url=(_get("OLLAMA_BASE_URL") or "http://127.0.0.1:11434/v1").strip().rstrip("/"),
         )

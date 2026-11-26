@@ -22,6 +22,7 @@ from typing import Any
 
 from dotenv import dotenv_values
 
+from .agents import AgentRegistry
 from .auth import atomic_write_env_token
 from .config import BridgeConfig, resolve_agy_executable
 from .conversations import _default_codex_dir, _default_ide_dir, list_local_conversations
@@ -332,7 +333,9 @@ def run_doctor(
     agy_cfg = str(env_vals.get("AGY_EXECUTABLE") or "agy")
     raw_token = str(env_vals.get("WEB_ACCESS_TOKEN") or "").strip()
     raw_bark = str(env_vals.get("BARK_PUSH_URL") or "").strip()
-    secret_list = [raw_token, raw_bark]
+    raw_ds_key = str(env_vals.get("DEEPSEEK_API_KEY") or "").strip()
+    raw_ark_key = str(env_vals.get("DOUBAO_ARK_API_KEY") or "").strip()
+    secret_list = [raw_token, raw_bark, raw_ds_key, raw_ark_key]
 
     backends = detect_local_backends(
         agy_cfg,
@@ -361,14 +364,20 @@ def run_doctor(
     bark_configured = False
     bark_target_redacted = ""
     skip_perm_warn = False
+    parsed_cfg: BridgeConfig | None = None
 
     if env_path.is_file():
         try:
             cfg = BridgeConfig.from_env(env_path)
+            parsed_cfg = cfg
             if cfg.web_access_token:
                 secret_list.append(cfg.web_access_token)
             if cfg.bark_push_url:
                 secret_list.append(cfg.bark_push_url)
+            if cfg.deepseek_api_key:
+                secret_list.append(cfg.deepseek_api_key)
+            if cfg.doubao_ark_api_key:
+                secret_list.append(cfg.doubao_ark_api_key)
             token_configured = len(cfg.web_access_token.strip()) >= 16 and cfg.web_access_token.strip() != "change-me"
             cfg_ok = cfg.web_pwa_enabled and token_configured
             lan_ip = get_lan_ipv4()
@@ -420,6 +429,36 @@ def run_doctor(
         conv_detail = _scrub_secret_text(f"扫描会话异常：{exc}", secret_list)
     checks.append({"name": "local_conversations", "ok": True, "detail": conv_detail})
 
+    ecosystem_summary: dict[str, Any] = {
+        "agents_configured": 0,
+        "desktop_apps_installed": 0,
+        "allow_agent_write": bool(parsed_cfg.stayy_allow_agent_write) if parsed_cfg else False,
+    }
+    try:
+        eco_cfg = parsed_cfg or BridgeConfig(web_access_token=raw_token or "doctor-placeholder-token")
+        reg = AgentRegistry(
+            eco_cfg,
+            project_dir=project_dir,
+            ide_store_dir=ide_store_dir,
+            has_pc_ide_sender=bool(backends.get("ide", {}).get("available")),
+        )
+        cat = reg.public_catalog()
+        eco_cli_api = [a for a in cat if a.get("kind") != "desktop_app" and a.get("configured")]
+        eco_desktop = [a for a in cat if a.get("kind") == "desktop_app" and a.get("installed")]
+        ecosystem_summary = {
+            "agents_configured": len(eco_cli_api),
+            "desktop_apps_installed": len(eco_desktop),
+            "allow_agent_write": bool(eco_cfg.stayy_allow_agent_write),
+            "agent_ids": [str(a.get("id") or "") for a in eco_cli_api],
+        }
+        eco_detail = (
+            f"生态插件已就绪：可对话代理 {len(eco_cli_api)} 个 · 桌面 AI 应用 {len(eco_desktop)} 个"
+            f"（写入权限={'开启' if eco_cfg.stayy_allow_agent_write else '默认只读'}）"
+        )
+    except Exception as exc:
+        eco_detail = _scrub_secret_text(f"扫描生态插件异常：{exc}", secret_list)
+    checks.append({"name": "ecosystem", "ok": True, **ecosystem_summary, "detail": eco_detail})
+
     overall = all(bool(c["ok"]) for c in checks)
     return {
         "ok": overall,
@@ -429,6 +468,7 @@ def run_doctor(
         "token_configured": token_configured,
         "bark_configured": bark_configured,
         "bark_target": bark_target_redacted,
+        "ecosystem": ecosystem_summary,
         "checks": checks,
     }
 

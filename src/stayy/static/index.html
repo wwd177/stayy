@@ -1265,6 +1265,8 @@
       animation: viewStageEnter 0.24s var(--spring-ios);
     }
     body.view-assistant .chat-wrap { display: none; }
+    body.view-assistant #iosInstallBanner,
+    body.view-more #iosInstallBanner { display: none !important; }
 
     .ai-hub-container {
       width: 100%;
@@ -1799,6 +1801,13 @@
     .composer-pill-btn.active-target {
       background: rgba(255, 255, 255, 0.06);
       color: #ececec;
+    }
+    #composerTargetLbl {
+      max-width: 112px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      display: inline-block;
     }
 
     .mic-btn {
@@ -2771,11 +2780,14 @@
         <input id="convSearchInput" class="drawer-search" type="search" placeholder="搜索全部电脑与手机会话..." />
       </div>
       <div id="drawerProjectsBox" class="drawer-projects"></div>
-      <div class="drawer-tabs">
+      <div class="drawer-tabs" id="drawerFilterTabs" style="flex-wrap:wrap;gap:5px">
         <button class="drawer-tab active" data-f="all">全部 <span id="cntAll"></span></button>
         <button class="drawer-tab" data-f="active">⚡待看 <span id="cntActive"></span></button>
         <button class="drawer-tab" data-f="ide">Antigravity <span id="cntIde"></span></button>
         <button id="fltCodexBtn" class="drawer-tab" data-f="codex">Codex <span id="cntCodex"></span></button>
+        <button id="fltDshBtn" class="drawer-tab" data-f="dsh" style="display:none">DeepSeek <span id="cntDsh"></span></button>
+        <button id="fltWbBtn" class="drawer-tab" data-f="workbuddy" style="display:none">WorkBuddy <span id="cntWb"></span></button>
+        <button id="fltEcoBtn" class="drawer-tab" data-f="eco_other" style="display:none">生态/API <span id="cntEco"></span></button>
         <button class="drawer-tab" data-f="cli">远程 <span id="cntCli"></span></button>
       </div>
     </div>
@@ -2881,9 +2893,10 @@
       <button type="button" id="inChatCloseBtn" class="pill-btn" style="padding:4px 9px">✕</button>
     </div>
 
-    <div id="iosInstallBanner" style="display:none;background:rgba(24,24,30,0.92);backdrop-filter:blur(18px);-webkit-backdrop-filter:blur(18px);border-bottom:1px solid var(--border-subtle);padding:9px 14px;font-size:12.5px;color:var(--text-pri);align-items:center;justify-content:space-between;gap:10px;flex-shrink:0;z-index:19">
-      <span style="line-height:1.45">点底部 <b>分享 → 添加到主屏幕</b>，即可生成永久全屏 iPhone App</span>
-      <button id="closeIosBannerBtn" type="button" style="background:transparent;border:none;color:var(--text-muted);font-size:16px;padding:2px 6px;cursor:pointer">✕</button>
+    <div id="iosInstallBanner" style="display:none;background:rgba(24,24,30,0.94);backdrop-filter:blur(18px);-webkit-backdrop-filter:blur(18px);border-bottom:1px solid var(--border-subtle);padding:9px 14px;font-size:12.5px;color:var(--text-pri);align-items:center;justify-content:space-between;gap:10px;flex-shrink:0;z-index:19">
+      <span id="iosInstallBannerText" style="line-height:1.45;flex:1">点底部 <b>分享 → 添加到主屏幕</b>，即可生成独立全屏手机 App</span>
+      <button id="pwaInstallNowBtn" type="button" class="pill-btn" style="display:none;background:#10b981;border-color:#10b981;color:#052e16;font-weight:700;padding:4px 10px;flex-shrink:0">📲 安装 App</button>
+      <button id="closeIosBannerBtn" type="button" style="background:transparent;border:none;color:var(--text-muted);font-size:16px;padding:2px 6px;cursor:pointer;flex-shrink:0">✕</button>
     </div>
 
   <!-- Main Chat Stream -->
@@ -3081,10 +3094,10 @@
     <div class="sheet" style="max-width:500px">
       <div class="sheet-handle"></div>
       <div class="sheet-hdr">
-        <h3>新建电脑端 Agent 会话</h3>
+        <h3>新建 AI Agent 会话</h3>
         <button id="closeWsPickerBtn" class="pill-btn">关闭</button>
       </div>
-      <div class="drawer-tabs" style="margin-bottom:12px">
+      <div id="wsPickerTargetTabs" class="drawer-tabs" style="margin-bottom:12px;flex-wrap:wrap;gap:6px">
         <button type="button" class="drawer-tab new-target-tab active" data-t="ide">Antigravity 电脑窗口</button>
         <button type="button" class="drawer-tab new-target-tab" data-t="codex">Codex 电脑会话</button>
         <button type="button" class="drawer-tab new-target-tab" data-t="cli">远程后台</button>
@@ -3321,7 +3334,60 @@
   const incomingToken = incomingHashKey || incomingQueryKey;
   let serverCapabilities = null;
   let backendStatus = null;
+  let agentCatalog = [];
   let lastAppliedNavSeq = 0;
+
+  function findAgentSpec(storeKey) {
+    return agentCatalog.find((a) => a && (a.store === storeKey || a.id === storeKey)) || null;
+  }
+
+  function storeDisplayName(storeKey) {
+    const spec = findAgentSpec(storeKey);
+    if (spec && spec.name) return spec.name;
+    const map = {
+      ide: 'Antigravity 电脑端',
+      codex: 'Codex 电脑端',
+      cli: '独立随身助手',
+      dsh: 'DeepSeek Harness',
+      workbuddy: 'WorkBuddy',
+      copilot: 'GitHub Copilot CLI',
+      doubao_api: '豆包 Ark',
+      deepseek_api: 'DeepSeek API',
+      ollama: '本机 Ollama',
+    };
+    return map[storeKey] || storeKey || 'Antigravity';
+  }
+
+  function renderWsPickerTargets() {
+    const box = $('wsPickerTargetTabs');
+    if (!box) return;
+    box.innerHTML = '';
+    const builtins = [
+      { store: 'ide', label: 'Antigravity 电脑窗口' },
+      { store: 'codex', label: 'Codex 电脑会话' },
+      { store: 'cli', label: '远程后台' },
+    ];
+    const items = [...builtins];
+    agentCatalog.forEach((ag) => {
+      if (!ag || (ag.kind !== 'native_cli' && ag.kind !== 'openai_api')) return;
+      if (['ide', 'codex', 'cli'].includes(ag.store)) return;
+      if (!ag.installed && !ag.configured) return;
+      const suffix = ag.configured ? (ag.read_only_enforced ? ' · 只读' : '') : ' · 待配';
+      items.push({ store: ag.store, label: `${ag.name}${suffix}`, configured: ag.configured });
+    });
+    items.forEach((it) => {
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'drawer-tab new-target-tab' + (newChatTarget === it.store ? ' active' : '');
+      btn.dataset.t = it.store;
+      btn.textContent = it.label;
+      btn.onclick = () => {
+        newChatTarget = it.store;
+        document.querySelectorAll('.new-target-tab').forEach((x) => x.classList.toggle('active', x === btn));
+      };
+      box.appendChild(btn);
+    });
+  }
 
   if (incomingToken) {
     try { localStorage.setItem('stayy_token', incomingToken); } catch (_) {}
@@ -3341,20 +3407,79 @@
   try { token = localStorage.getItem('stayy_token') || incomingToken || ''; } catch (_) { token = incomingToken; }
   let apiBase = '';
   let connectingBeacon = false;
+  let deferredInstallPrompt = null;
 
-  if (isStaticShell && isIOS && !isStandalone) {
-    try {
-      if (!sessionStorage.getItem('hide_ios_banner')) {
-        $('iosInstallBanner').style.display = 'flex';
-      }
-    } catch (_) {
-      $('iosInstallBanner').style.display = 'flex';
+  function syncInstallBannerUi() {
+    const banner = $('iosInstallBanner');
+    const txtEl = $('iosInstallBannerText');
+    const actBtn = $('pwaInstallNowBtn');
+    if (!banner || !txtEl || !actBtn) return;
+
+    if (isStandalone) {
+      banner.style.display = 'none';
+      return;
     }
+    let hiddenByUser = false;
+    try { hiddenByUser = sessionStorage.getItem('stayy_hide_install_banner') === '1'; } catch (_) {}
+
+    if (deferredInstallPrompt) {
+      txtEl.innerHTML = '将 <b>Stayy</b> 安装到手机桌面，享全屏独立 App 与消息直达';
+      actBtn.style.display = 'inline-flex';
+      if (!hiddenByUser) banner.style.display = 'flex';
+      return;
+    }
+    actBtn.style.display = 'none';
+    if (isIOS) {
+      txtEl.innerHTML = isStaticShell
+        ? '点底部 <b>分享 → 添加到主屏幕</b>，生成永久独立 iPhone App'
+        : '点底部 <b>分享 → 添加到主屏幕</b>，以独立全屏 Stayy App 运行';
+      if (!hiddenByUser) banner.style.display = 'flex';
+    } else if (/Android|Mobile|HarmonyOS/i.test(navigator.userAgent)) {
+      txtEl.innerHTML = '在浏览器菜单选择 <b>添加到主屏幕 / 安装应用</b>，即刻启用独立 Stayy App';
+      if (!hiddenByUser) banner.style.display = 'flex';
+    }
+  }
+
+  async function triggerPwaInstall() {
+    if (deferredInstallPrompt) {
+      try {
+        await deferredInstallPrompt.prompt();
+        const choice = await deferredInstallPrompt.userChoice;
+        if (choice && choice.outcome === 'accepted') {
+          showToast('正在安装 Stayy 手机 App...');
+          $('iosInstallBanner').style.display = 'none';
+        }
+      } catch (_) {}
+      deferredInstallPrompt = null;
+      syncInstallBannerUi();
+      return;
+    }
+    if (isIOS) {
+      showToast('请点击 Safari 底部「分享」按钮，选择「添加到主屏幕」');
+    } else {
+      showToast('请点击浏览器右上角菜单「⋮」→「添加到主屏幕 / 安装应用」');
+    }
+  }
+
+  window.addEventListener('beforeinstallprompt', (e) => {
+    e.preventDefault();
+    deferredInstallPrompt = e;
+    syncInstallBannerUi();
+  });
+  window.addEventListener('appinstalled', () => {
+    deferredInstallPrompt = null;
+    if ($('iosInstallBanner')) $('iosInstallBanner').style.display = 'none';
+    showToast('✓ Stayy 已安装到桌面，可独立 App 启动');
+  });
+
+  if ($('pwaInstallNowBtn')) $('pwaInstallNowBtn').onclick = triggerPwaInstall;
+  if ($('closeIosBannerBtn')) {
     $('closeIosBannerBtn').onclick = () => {
       $('iosInstallBanner').style.display = 'none';
-      try { sessionStorage.setItem('hide_ios_banner', '1'); } catch (_) {}
+      try { sessionStorage.setItem('stayy_hide_install_banner', '1'); } catch (_) {}
     };
   }
+  syncInstallBannerUi();
 
   function syncManifestToken() {
     // Manifest start_url is strictly `./` and never embeds master tokens
@@ -3914,7 +4039,7 @@
   }
 
   function getEffectiveTargetEngine() {
-    if (activeConvStore === 'ide' || activeConvStore === 'codex' || activeConvStore === 'cli') {
+    if (activeConvStore) {
       return activeConvStore;
     }
     return newChatTarget || 'ide';
@@ -3926,22 +4051,25 @@
     const rttTag = lastRttMs ? ` · ${lastRttMs}ms` : '';
     const effTarget = getEffectiveTargetEngine();
     const inConv = hasVisibleMessages();
+    const spec = findAgentSpec(effTarget);
 
     let engineLabel = mShort;
     if (effTarget === 'ide') {
       engineLabel = (backendStatus && backendStatus.ide_available === false) ? 'Antigravity (未打开)' : 'Antigravity 电脑端';
     } else if (effTarget === 'codex') {
       engineLabel = (backendStatus && backendStatus.codex_available === false) ? 'Codex (未检测到)' : 'Codex 电脑端';
-    } else if (!inConv) {
-      engineLabel = '独立随身助手';
+    } else if (effTarget === 'cli') {
+      engineLabel = inConv ? mShort : '独立随身助手';
+    } else {
+      engineLabel = storeDisplayName(effTarget) + (spec && spec.read_only_enforced ? ' (只读沙箱)' : '');
     }
 
     subInfo.textContent = `${engineLabel}${wsName ? ' · ' + wsName : ''}${rttTag}`;
 
     // On empty Home or AI Assistant hub, show the active engine cleanly in the top pill; inside active chat, show the conversation title!
-    const topName = effTarget === 'codex' ? 'Codex 电脑端' : (effTarget === 'cli' ? '独立随身助手' : 'Antigravity');
+    const topName = effTarget === 'ide' ? 'Antigravity' : storeDisplayName(effTarget);
     if (currentMainView === 'assistant') {
-      $('headerTitle').textContent = `AI 助手 · ${topName}`;
+      $('headerTitle').textContent = `AI 生态 · ${topName}`;
     } else if (inConv) {
       const cleanT = (activeConvTitle && !['反重力助手', 'Stayy'].includes(activeConvTitle)) ? activeConvTitle : topName;
       $('headerTitle').textContent = cleanT;
@@ -3953,7 +4081,8 @@
     if (tgtLbl) {
       if (effTarget === 'ide') tgtLbl.textContent = 'Antigravity';
       else if (effTarget === 'codex') tgtLbl.textContent = 'Codex';
-      else tgtLbl.textContent = inConv ? mShort : '随身助手';
+      else if (effTarget === 'cli') tgtLbl.textContent = inConv ? mShort : '随身助手';
+      else tgtLbl.textContent = storeDisplayName(effTarget).slice(0, 12);
     }
     syncAppChromeState();
   }
@@ -5265,6 +5394,8 @@
       if (data.type === 'hello') {
         serverCapabilities = data.capabilities || null;
         backendStatus = data.backend_status || null;
+        agentCatalog = Array.isArray(data.agents) ? data.agents : [];
+        renderWsPickerTargets();
         if (Number.isFinite(Number(data.nav_seq))) {
           lastAppliedNavSeq = Math.max(lastAppliedNavSeq, Number(data.nav_seq));
         }
@@ -5316,8 +5447,20 @@
           restoreInflightStream(data.inflight);
         }
         refreshHeaderSubtitle();
+        renderAssistantHub();
         syncAppChromeState();
         flushOutboundQueue(wsInstance);
+      } else if (data.type === 'agents_catalog') {
+        agentCatalog = Array.isArray(data.agents) ? data.agents : [];
+        renderWsPickerTargets();
+        renderAssistantHub();
+        refreshHeaderSubtitle();
+      } else if (data.type === 'desktop_app_launched') {
+        showToast(data.note || (data.ok ? '已唤醒电脑端 AI 应用' : '启动失败'), 3200);
+        if (data.ok) {
+          openDesktopModal();
+          setDeskControlMode('loupe');
+        }
       } else if (data.type === 'slots_overview') {
         applySlotsOverview(data);
       } else if (data.type === 'chat_ack') {
@@ -5396,6 +5539,7 @@
           restoreInflightStream(data.inflight);
         }
         refreshHeaderSubtitle();
+        renderAssistantHub();
         syncAppChromeState();
         flushOutboundQueue(wsInstance);
         if (!data.silent) {
@@ -6035,8 +6179,24 @@
       l1.textContent = isOnline ? `● 已连接电脑网关 (${rtt})` : '○ 正在连接电脑网关...';
       const l2 = document.createElement('div');
       l2.textContent = `当前目录：${wsName} · 会话总数：${allConvItems.length}`;
+      const l3 = document.createElement('div');
+      l3.style.cssText = 'margin-top:6px;display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap';
+      const appBadge = document.createElement('span');
+      appBadge.style.cssText = isStandalone ? 'color:#6ee7b7;font-weight:600' : 'color:var(--text-muted)';
+      appBadge.textContent = isStandalone ? '📲 独立手机 App 模式已激活' : '🌐 浏览器访问模式（可安装为独立 App）';
+      l3.appendChild(appBadge);
+      if (!isStandalone) {
+        const instBtn = document.createElement('button');
+        instBtn.type = 'button';
+        instBtn.className = 'pill-btn';
+        instBtn.style.cssText = 'padding:4px 10px;background:rgba(16,185,129,0.16);border-color:rgba(16,185,129,0.45);color:#6ee7b7;font-weight:600';
+        instBtn.textContent = deferredInstallPrompt ? '📲 一键安装 Stayy App' : '📲 添加到桌面指引';
+        instBtn.onclick = () => triggerPwaInstall();
+        l3.appendChild(instBtn);
+      }
       statusEl.appendChild(l1);
       statusEl.appendChild(l2);
+      statusEl.appendChild(l3);
     }
     $('settingsModal').classList.add('show');
   }
@@ -6317,8 +6477,14 @@
     refreshHeaderSubtitle();
     renderAssistantHub();
     renderHeroDeck();
-    const labelMap = { ide: 'Antigravity 电脑端', codex: 'Codex 电脑端', cli: '独立随身助手（不打扰电脑窗口）' };
-    showToast(`✦ 已切换至 ${labelMap[targetMode] || targetMode}`);
+    showToast(`✦ 已切换至 ${storeDisplayName(targetMode)}`);
+  }
+
+  function launchDesktopAiApp(appSpec) {
+    if (!appSpec || !appSpec.id) return;
+    if (!ws || ws.readyState !== 1) return showToast('正在连接电脑网关...');
+    showToast(`正在唤起「${appSpec.name}」并切换 3.2× 放大镜...`);
+    ws.send(JSON.stringify({ type: 'desktop_app_launch', app_id: appSpec.id }));
   }
 
   function renderAssistantHub() {
@@ -6327,7 +6493,7 @@
     root.innerHTML = '';
     const effTarget = getEffectiveTargetEngine();
 
-    // 1. Hero Mode Switcher Card
+    // 1. Hero Mode & Native Ecosystem Agent Switcher Card
     const banner = document.createElement('div');
     banner.className = 'ai-hero-banner';
 
@@ -6335,29 +6501,61 @@
     top.className = 'ai-hero-top';
     const title = document.createElement('div');
     title.className = 'ai-hero-title';
-    title.textContent = '✦ 智能 AI 助手中枢';
+    title.textContent = '✦ Stayy 全生态 AI 中枢';
     top.appendChild(title);
+    const refBtn = document.createElement('button');
+    refBtn.type = 'button';
+    refBtn.className = 'pill-btn';
+    refBtn.style.cssText = 'padding:3px 9px;font-size:11px';
+    refBtn.textContent = '↻ 刷新生态';
+    refBtn.onclick = () => {
+      if (ws && ws.readyState === 1) {
+        ws.send(JSON.stringify({ type: 'agents_refresh' }));
+        ws.send(JSON.stringify({ type: 'list_conversations' }));
+        showToast('正在扫描电脑端 AI Agent...');
+      }
+    };
+    top.appendChild(refBtn);
     banner.appendChild(top);
 
+    const activeSpec = findAgentSpec(effTarget);
     const sub = document.createElement('div');
     sub.className = 'ai-hero-sub';
-    sub.textContent = effTarget === 'cli'
-      ? '当前为「独立随身助手」：直接在手机端极速问答，不弹窗、不改动电脑焦点。'
-      : (effTarget === 'codex'
-        ? '当前联动「Codex 电脑端」：适合深度代码推理、红队审计与仓库重构。'
-        : '当前联动「Antigravity 电脑端」：指令实时投递至电脑主窗口同步执行。');
+    sub.textContent = activeSpec && activeSpec.description
+      ? `当前「${activeSpec.name}」：${activeSpec.description}`
+      : '自由切换电脑端所有本地 CLI / 云端 API / 桌面 AI 客户端';
     banner.appendChild(sub);
 
     const seg = document.createElement('div');
     seg.className = 'ai-mode-seg';
-    [
-      { key: 'ide', name: '✦ Antigravity', desc: '操控电脑窗口' },
-      { key: 'codex', name: '>_ Codex', desc: '电脑编程线程' },
-      { key: 'cli', name: '☁ 随身问答', desc: '手机独立对话' },
-    ].forEach((m) => {
+    seg.style.flexWrap = 'wrap';
+
+    const nativeModes = [
+      { key: 'ide', name: '✦ Antigravity', desc: '操控电脑窗口', ok: true },
+      { key: 'codex', name: '>_ Codex', desc: '电脑编程线程', ok: !backendStatus || backendStatus.codex_available !== false },
+      { key: 'cli', name: '☁ 随身问答', desc: '手机独立对话', ok: true },
+    ];
+    agentCatalog.forEach((ag) => {
+      if (!ag || (ag.kind !== 'native_cli' && ag.kind !== 'openai_api')) return;
+      if (['ide', 'codex', 'cli'].includes(ag.store)) return;
+      if (!ag.installed && !ag.configured) return;
+      const descTxt = ag.configured
+        ? (ag.read_only_enforced ? `${ag.vendor} · 只读安全` : ag.vendor)
+        : (ag.store === 'ollama' ? '需在主机运行 Ollama' : '需在主机 .env 配 Key');
+      nativeModes.push({
+        key: ag.store,
+        name: `${ag.badge ? `[${ag.badge}] ` : ''}${ag.name}`,
+        desc: descTxt,
+        ok: Boolean(ag.configured),
+      });
+    });
+
+    nativeModes.forEach((m) => {
       const b = document.createElement('button');
       b.type = 'button';
       b.className = 'ai-mode-btn' + (effTarget === m.key ? ' active' : '');
+      b.style.minWidth = '30%';
+      b.style.flex = '1 1 104px';
       b.dataset.aimode = m.key;
       const nSpan = document.createElement('span');
       nSpan.textContent = m.name;
@@ -6366,11 +6564,88 @@
       sSpan.textContent = m.desc;
       b.appendChild(nSpan);
       b.appendChild(sSpan);
-      b.onclick = () => switchAssistantEngineMode(m.key);
+      b.onclick = () => {
+        switchAssistantEngineMode(m.key);
+        setMainView('home');
+      };
       seg.appendChild(b);
     });
     banner.appendChild(seg);
     root.appendChild(banner);
+
+    // 1b. Mobile Standalone App Install & Status Strip
+    const appCard = document.createElement('div');
+    appCard.style.cssText = 'background:rgba(16,185,129,0.08);border:1px solid rgba(16,185,129,0.28);border-radius:16px;padding:12px 14px;display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:14px';
+    const appLeft = document.createElement('div');
+    appLeft.style.minWidth = '0';
+    const appT = document.createElement('div');
+    appT.style.cssText = 'font-size:13.5px;font-weight:700;color:#fff';
+    appT.textContent = isStandalone ? '📲 Stayy 独立 App 已激活' : '📲 安装 Stayy 到手机桌面 App';
+    const appS = document.createElement('div');
+    appS.style.cssText = 'font-size:12px;color:var(--text-sec);margin-top:2px';
+    appS.textContent = isStandalone
+      ? '全屏离线外壳运行中 · 支持随身后台与永久入口直连'
+      : (isIOS ? 'Safari 点底部「分享 → 添加到主屏幕」生成独立图标' : '一键添加到手机桌面，像原生 App 一样全屏启动');
+    appLeft.appendChild(appT);
+    appLeft.appendChild(appS);
+    appCard.appendChild(appLeft);
+    if (!isStandalone) {
+      const instBtn = document.createElement('button');
+      instBtn.type = 'button';
+      instBtn.id = 'hubInstallAppBtn';
+      instBtn.className = 'pill-btn';
+      instBtn.style.cssText = 'background:#10b981;border-color:#10b981;color:#052e16;font-weight:700;padding:6px 12px;flex-shrink:0';
+      instBtn.textContent = deferredInstallPrompt ? '立即安装' : '安装指引';
+      instBtn.onclick = () => triggerPwaInstall();
+      appCard.appendChild(instBtn);
+    }
+    root.appendChild(appCard);
+
+    // 1c. Desktop AI Apps Direct Control (Doubao Desktop, TRAE CN, Gemini, Grok, WorkBuddy, DSH, etc.)
+    const desktopApps = agentCatalog.filter((a) => a && a.kind === 'desktop_app');
+    if (desktopApps.length > 0) {
+      const lblDesk = document.createElement('div');
+      lblDesk.className = 'ai-sec-label';
+      lblDesk.textContent = `电脑桌面 AI 客户端直控（${desktopApps.length} 款 · 点击唤起并进放大镜）`;
+      root.appendChild(lblDesk);
+
+      const dGrid = document.createElement('div');
+      dGrid.className = 'ai-skills-grid';
+      desktopApps.forEach((app, idx) => {
+        const card = document.createElement('button');
+        card.type = 'button';
+        card.className = 'ai-skill-card';
+        card.dataset.appid = app.id;
+        card.style.setProperty('--stagger', String(idx));
+
+        const topR = document.createElement('div');
+        topR.style.cssText = 'display:flex;align-items:center;justify-content:space-between;width:100%;margin-bottom:4px';
+        const badge = document.createElement('span');
+        badge.style.cssText = `display:inline-flex;align-items:center;justify-content:center;width:30px;height:30px;border-radius:9px;font-size:11px;font-weight:800;color:#fff;background:${app.accent || '#3b82f6'}`;
+        badge.textContent = app.badge || 'AI';
+        const stLbl = document.createElement('span');
+        stLbl.style.cssText = app.running
+          ? 'font-size:10.5px;color:#6ee7b7;font-weight:600'
+          : 'font-size:10.5px;color:var(--text-muted)';
+        stLbl.textContent = app.running ? '● 运行中' : '点击启动';
+        topR.appendChild(badge);
+        topR.appendChild(stLbl);
+
+        const t = document.createElement('div');
+        t.className = 'ai-skill-title';
+        t.textContent = app.name;
+        const d = document.createElement('div');
+        d.className = 'ai-skill-desc';
+        d.textContent = `${app.vendor} · ${app.description}`;
+
+        card.appendChild(topR);
+        card.appendChild(t);
+        card.appendChild(d);
+        card.onclick = () => launchDesktopAiApp(app);
+        dGrid.appendChild(card);
+      });
+      root.appendChild(dGrid);
+    }
 
     // 2. 2x2 Specialist Workflow Skills
     const lblSkills = document.createElement('div');
@@ -6729,13 +7004,22 @@
     const nAct = allConvItems.filter((x) => isConvAttention(x) || pinnedConvIds.has(x.conversation_id)).length;
     const nIde = allConvItems.filter((x) => x.store === 'ide').length;
     const nCodex = allConvItems.filter((x) => x.store === 'codex').length;
+    const nDsh = allConvItems.filter((x) => x.store === 'dsh').length;
+    const nWb = allConvItems.filter((x) => x.store === 'workbuddy').length;
+    const nEco = allConvItems.filter((x) => !['ide', 'codex', 'cli', 'dsh', 'workbuddy'].includes(x.store)).length;
     const nCli = allConvItems.filter((x) => x.store === 'cli').length;
     $('cntAll').textContent = nAll ? `(${nAll})` : '';
     $('cntActive').textContent = nAct ? `(${nAct})` : '';
     $('cntIde').textContent = nIde ? `(${nIde})` : '';
     $('cntCodex').textContent = nCodex ? `(${nCodex})` : '';
+    if ($('cntDsh')) $('cntDsh').textContent = nDsh ? `(${nDsh})` : '';
+    if ($('cntWb')) $('cntWb').textContent = nWb ? `(${nWb})` : '';
+    if ($('cntEco')) $('cntEco').textContent = nEco ? `(${nEco})` : '';
     $('cntCli').textContent = nCli ? `(${nCli})` : '';
     $('fltCodexBtn').style.display = 'inline-block';
+    if ($('fltDshBtn')) $('fltDshBtn').style.display = (nDsh > 0 || findAgentSpec('dsh')?.configured) ? 'inline-block' : 'none';
+    if ($('fltWbBtn')) $('fltWbBtn').style.display = (nWb > 0 || findAgentSpec('workbuddy')?.configured) ? 'inline-block' : 'none';
+    if ($('fltEcoBtn')) $('fltEcoBtn').style.display = nEco > 0 ? 'inline-block' : 'none';
     if ($('drawerAgyCnt')) {
       $('drawerAgyCnt').textContent = nIde > 0 ? String(nIde) : '';
       $('drawerAgyCnt').style.display = nIde > 0 ? 'inline-block' : 'none';
@@ -6821,6 +7105,8 @@
       if (activeProjectFilter && it.workspace !== activeProjectFilter) return false;
       if (convFilter === 'active') {
         if (!isConvAttention(it) && !pinnedConvIds.has(it.conversation_id)) return false;
+      } else if (convFilter === 'eco_other') {
+        if (['ide', 'codex', 'cli', 'dsh', 'workbuddy'].includes(it.store)) return false;
       } else if (convFilter !== 'all' && it.store !== convFilter) {
         return false;
       }
@@ -6904,10 +7190,21 @@
         rTag.className = 'conv-tag run';
         rTag.textContent = '运行中';
         rightWrap.appendChild(rTag);
-      } else if (showFilterBadges || it.store === 'codex') {
+      } else if (showFilterBadges || it.store !== 'ide') {
         const sTag = document.createElement('span');
         sTag.className = it.store === 'codex' ? 'conv-tag codex' : 'conv-tag';
-        sTag.textContent = it.store === 'codex' ? 'Codex' : (it.store === 'ide' ? 'PC' : '远程');
+        const tagMap = {
+          ide: 'PC',
+          codex: 'Codex',
+          cli: '远程',
+          dsh: 'DSH',
+          workbuddy: 'WB',
+          copilot: 'Copilot',
+          doubao_api: '豆包',
+          deepseek_api: 'DS API',
+          ollama: 'Ollama',
+        };
+        sTag.textContent = tagMap[it.store] || (it.source_label || it.store);
         rightWrap.appendChild(sTag);
       }
 

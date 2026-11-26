@@ -17,8 +17,13 @@
 - **Hardened Single-Host Multi-Device Auth & 1-Click Revocation**
   - Runs on an isolated port (`8766` by default) with **epoch-bound session cookies & media tickets** and **short-lived one-time pairing codes (`?pair=`)**.
   - Clicking **「🔒 踢出并换密」** on the Windows console calls an **isolated loopback-only admin port** (never exposed through public tunnels), atomically rotates `WEB_ACCESS_TOKEN` in `.env`, increments `auth_epoch`, purges media/approval caches, and disconnects all active phones with `4001`.
-- **Reuses Your Local Tools & Subscriptions (No Cloud Bot Required)**
-  - Works with your already logged-in **Antigravity IDE**, **Codex Desktop**, or **`agy` CLI** on Windows (at least one installed). Defaults `AGY_DANGEROUSLY_SKIP_PERMISSIONS=false` for safety.
+- **Reuses Your Local Tools & Multi-Agent Ecosystem (v0.2)**
+  - Supports **Antigravity IDE**, **Codex Desktop**, **`agy` CLI**, **DeepSeek Harness (`dsh`)**, **Tencent WorkBuddy (`workbuddy`)**, and **GitHub Copilot CLI (`copilot`)** via a modular adapter layer (`src/stayy/agents/`), plus OpenAI-compatible cloud/local endpoints (**Doubao Ark**, **DeepSeek API**, **Ollama**, and custom entries via `agents.local.json`).
+  - **Read-Only First Safety**: External CLI adapters default strictly to read-only flags (`STAYY_ALLOW_AGENT_WRITE=false`, `AGY_DANGEROUSLY_SKIP_PERMISSIONS=false`, no `-y` or `--allow-all` bypasses).
+  - **Zero-Trust Desktop AI Launch + `3.2×` Loupe**: Launch or focus local desktop AI clients (**Doubao Desktop**, **TRAE CN**, **DeepSeek Harness**, **WorkBuddy**, **Copilot**, **Gemini**, **Grok Bot**, etc.) with strict reparse/junction-free PE validation, non-elevated UAC check, and zero CLI arguments, then operate their PC windows cleanly through Stayy's `3.2×` optical loupe.
+- **Native Mobile App & Permanent App Closed-Loop**
+  - One-tap mobile PWA install banner (`beforeinstallprompt` + iOS 2-step home-screen guide) with complete offline shell (`manifest.json` `id`/`scope`/maskable icons + Service Worker).
+  - Windows console **「📲 永久 App」** tab offers an explicit opt-in setup for user-owned GitHub repositories (blocking upstream author repos and blocking `#key=` QR emission on HTTP 404 or stale CDN caches until `host_id` + `nonce` live verification succeeds).
 - **Privacy-Preserving Bark Notifications (Opt-In)**
   - Set `BARK_PUSH_URL` to receive generic lock-screen reminders when a prompt awaits attention — zero commands, file paths, screenshots, or tokens ever leave your machine in push notifications, protected by strict HTTPS/non-private SSRF and no-redirect checks.
 
@@ -54,6 +59,10 @@ Then double-click **`Stayy.lnk`** on your Desktop (or run `.\.venv\Scripts\pytho
 2. **Closed Media & WebSocket Authorization**: `/dl/<id>` never falls back to open CORS (`*`), requires a valid epoch-bound session cookie or short-lived ticket, and returns `0` bytes on `401`.
 3. **Zero Plaintext Secret Leakage**: `python -m stayy.setup_wizard --doctor --json` redacts tokens and push URLs across stdout, stderr, and JSON outputs.
 4. **Upstream Beacon Protection**: `BEACON_ENABLED=false` by default so cloned setups never push to upstream repositories or display unverified third-party QR URLs.
+5. **Endpoint-Pinned SSRF Defense**: OpenAI-compatible API calls disallow unencrypted public URLs, block HTTP redirects, deny private/link-local IPs, and restrict loopback traffic solely to explicit `STAYY_ALLOW_LOCAL_LLM_PORTS` (default Ollama `11434` / LM Studio `1234`).
+6. **Composite Concurrency Isolation**: Multi-agent CLI/API turns serialize per `(store, workspace, session_id)` and cancel/launch barriers serialize with `auth_epoch` revocation under `_revoke_exec_lock`.
+
+> See `agents.local.example.json` and `.env.example` for optional DeepSeek, Doubao Ark, Ollama, and custom desktop AI configuration.
 
 ---
 

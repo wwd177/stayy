@@ -1,0 +1,21 @@
+{
+  "custom_apis": [
+    {
+      "id": "custom_openai",
+      "name": "自定义 OpenAI 兼容模型",
+      "base_url": "https://api.openai.com/v1",
+      "api_key": "",
+      "model": "gpt-4o-mini",
+      "description": "本机配置的可选 OpenAI 兼容 API（留空 api_key 则保持未启用）"
+    }
+  ],
+  "custom_desktop_apps": [
+    {
+      "id": "my_ai_app",
+      "name": "自定义电脑 AI 客户端",
+      "exe_path": "C:\\Path\\To\\App.exe",
+      "vendor": "Custom",
+      "description": "仅在本机配置文件编辑，手机端不可传入可执行路径或参数"
+    }
+  ]
+}

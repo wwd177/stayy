@@ -16,6 +16,7 @@ import socket
 import sqlite3
 import subprocess
 import sys
+import threading
 import time
 import uuid
 from collections import OrderedDict
@@ -30,6 +31,15 @@ from websockets.asyncio.server import ServerConnection
 from websockets.datastructures import Headers
 from websockets.http11 import Request, Response
 
+from .agents import (
+    AgentRegistry,
+    AgentRunResult,
+    AgentTurnCallbacks,
+    kill_pid_tree_sync,
+    make_composite_slot_key,
+)
+from .agents.cli_adapters import run_cli_agent_turn
+from .agents.openai_compat import run_openai_compat_turn
 from .agy_session import AgySession, SessionManager, TurnResult, _kill_process_tree_win32
 from .approvals import ApprovalReadonlyTracker, deny_auto_invoke, inspect_ide_actions_readonly
 from .auth import (
@@ -477,6 +487,12 @@ class WebPwaServer:
         ide_store_dir: Path | None = None,
         cli_store_dir: Path | None = None,
         codex_store_dir: Path | None = None,
+        dsh_store_dir: Path | None = None,
+        workbuddy_store_dir: Path | None = None,
+        copilot_store_dir: Path | None = None,
+        api_sessions_dir: Path | None = None,
+        local_app_data: Path | None = None,
+        ecosystem_project_dir: Path | None = None,
         continuation_map_path: Path | None = None,
         pc_window_sender: Callable[[str, str, str], tuple[bool, str]] | None = None,
         pc_window_new_opener: Callable[[], tuple[bool, str]] | None = None,
@@ -503,6 +519,21 @@ class WebPwaServer:
         self.ide_store_dir = ide_store_dir
         self.cli_store_dir = cli_store_dir
         self.codex_store_dir = codex_store_dir
+        self.dsh_store_dir = dsh_store_dir
+        self.workbuddy_store_dir = workbuddy_store_dir
+        self.copilot_store_dir = copilot_store_dir
+        isolated_test_dirs = ide_store_dir is not None or cli_store_dir is not None
+        self._api_sessions_dir: Path | None = (
+            api_sessions_dir
+            if api_sessions_dir is not None
+            else (
+                (runtime_dir / "api_sessions")
+                if runtime_dir is not None
+                else (None if isolated_test_dirs else (self.runtime_dir / "api_sessions"))
+            )
+        )
+        self._ecosystem_project_dir = ecosystem_project_dir or PROJECT_ROOT
+        self._local_app_data = local_app_data
         self._pc_window_sender: Callable[[str, str, str], tuple[bool, str]] | None = (
             pc_window_sender
             if pc_window_sender is not None
@@ -607,6 +638,19 @@ class WebPwaServer:
         self._ide_watch_sig: tuple[str, str, int, int] = ("", "", 0, 0)
         self.pc_ide_poll_interval: float = 0.55
         self.pc_ide_accept_timeout: float = 10.0
+        self._revoke_exec_lock = threading.Lock()
+        self._active_agent_cancels: dict[str, asyncio.Event] = {}
+        self._active_agent_procs: dict[str, asyncio.subprocess.Process] = {}
+        self._inflight_comp_keys: set[str] = set()
+        self.agent_registry = AgentRegistry(
+            config,
+            project_dir=self._ecosystem_project_dir,
+            runtime_dir=self.runtime_dir,
+            ide_store_dir=ide_store_dir,
+            codex_cli_path=codex_cli_path,
+            local_app_data=local_app_data,
+            has_pc_ide_sender=self._pc_window_sender is not None,
+        )
 
     @property
     def access_token(self) -> str:
@@ -830,6 +874,15 @@ class WebPwaServer:
         if not ok:
             return False, 0, new_epoch
 
+        with self._revoke_exec_lock:
+            cancels = list(self._active_agent_cancels.values())
+            procs = list(self._active_agent_procs.values())
+        for cev in cancels:
+            cev.set()
+        for p in procs:
+            if p.returncode is None and p.pid:
+                await asyncio.to_thread(kill_pid_tree_sync, p.pid)
+
         stale_ws: list[ServerConnection] = []
         async with self._clients_lock:
             self._media_registry.clear()
@@ -968,17 +1021,19 @@ class WebPwaServer:
 
         if path == "/manifest.json":
             manifest = {
+                "id": "./",
                 "name": "Stayy",
                 "short_name": "Stayy",
                 "description": "Local-first AI Coding & Precision PC Remote Hub",
                 "start_url": "./",
+                "scope": "./",
                 "display": "standalone",
                 "background_color": "#000000",
                 "theme_color": "#000000",
                 "orientation": "portrait-primary",
                 "icons": [
-                    {"src": "/icon-192.png", "sizes": "192x192", "type": "image/png"},
-                    {"src": "/icon-512.png", "sizes": "512x512", "type": "image/png"},
+                    {"src": "/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any maskable"},
+                    {"src": "/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any maskable"},
                 ],
             }
             body = json.dumps(manifest, ensure_ascii=False).encode("utf-8")
@@ -1324,6 +1379,8 @@ class WebPwaServer:
                     "nav_seq": self._nav_seq,
                     "capabilities": self._build_capabilities(),
                     "backend_status": self._build_backend_status(),
+                    "agents": self.agent_registry.public_catalog(),
+                    "agent_write_enabled": bool(self.config.stayy_allow_agent_write),
                     "slot": slot,
                     "model": hello_model,
                     "workspace": str(session.workspace),
@@ -1485,6 +1542,14 @@ class WebPwaServer:
                             killed = True
                         except Exception:
                             pass
+                    ag_cancel = self._active_agent_cancels.get(cur_slot)
+                    if ag_cancel is not None:
+                        ag_cancel.set()
+                        killed = True
+                    ag_proc = self._active_agent_procs.get(cur_slot)
+                    if ag_proc is not None and ag_proc.returncode is None and ag_proc.pid:
+                        await asyncio.to_thread(kill_pid_tree_sync, ag_proc.pid)
+                        killed = True
                     killed = (await self._session_for_slot(cur_slot).cancel_current()) or killed
                     note = "已停止当前生成。" if killed else "当前没有运行中的任务。"
                     await self._safe_send(ws, {"type": "toast", "level": "info", "text": note})
@@ -1648,9 +1713,49 @@ class WebPwaServer:
                         {"type": "toast", "level": "info" if ok else "err", "text": note},
                     )
 
+                elif mtype == "agents_refresh":
+                    await asyncio.to_thread(self.agent_registry.refresh)
+                    await self._safe_send(
+                        ws,
+                        {"type": "agents_catalog", "agents": self.agent_registry.public_catalog()},
+                    )
+
+                elif mtype == "desktop_app_launch":
+                    req_app_id = str(msg.get("app_id") or "").strip().lower()
+
+                    def _do_launch_guarded() -> tuple[bool, bool, str, str]:
+                        with self._revoke_exec_lock:
+                            if not self.auth.is_epoch_active(conn_epoch):
+                                return False, False, "配对已撤销，应用启动已拦截", "revoked"
+                            if not self._build_capabilities()["remote_desktop"]["enabled"]:
+                                return False, False, "当前主机未启用远程桌面控制", "capabilities_denied"
+                            ok_l, foc_l, note_l = self.agent_registry.launch_desktop_app(req_app_id)
+                            return ok_l, foc_l, note_l, ""
+
+                    ok_app, focused_app, note_app, err_code = await asyncio.to_thread(_do_launch_guarded)
+                    if not self.auth.is_epoch_active(conn_epoch) or err_code == "revoked":
+                        await ws.close(code=4001, reason="Revoked")
+                        break
+                    await self._safe_send(
+                        ws,
+                        {
+                            "type": "desktop_app_launched",
+                            "ok": ok_app,
+                            "app_id": req_app_id,
+                            "focused": focused_app,
+                            "note": note_app,
+                            **({"code": err_code} if err_code else {}),
+                        },
+                    )
+                    if ok_app:
+                        await self._safe_send(
+                            ws,
+                            {"type": "agents_catalog", "agents": self.agent_registry.public_catalog()},
+                        )
+
                 elif mtype == "chat":
                     req_slot = str(msg.get("slot") or self._active_slot)
-                    t = asyncio.create_task(self._handle_chat(ws, msg, req_slot))
+                    t = asyncio.create_task(self._handle_chat(ws, msg, req_slot, conn_epoch=conn_epoch))
                     self._tasks.add(t)
                     t.add_done_callback(self._tasks.discard)
         except websockets.exceptions.ConnectionClosed:
@@ -1753,13 +1858,28 @@ class WebPwaServer:
     async def _handle_list_conversations(self, ws: ServerConnection) -> None:
         session = self._session_for_slot(self._active_slot)
         meta = self._slot_meta.get(self._active_slot, {})
-        items = await asyncio.to_thread(
-            list_local_conversations,
-            500,
-            self.ide_store_dir,
-            self.cli_store_dir,
-            self.codex_store_dir,
-        )
+
+        def _collect_items_and_workspaces() -> tuple[list[ConversationItem], list[str]]:
+            scanned = list_local_conversations(
+                500,
+                self.ide_store_dir,
+                self.cli_store_dir,
+                self.codex_store_dir,
+                self.dsh_store_dir,
+                self.workbuddy_store_dir,
+                self.copilot_store_dir,
+                self._api_sessions_dir,
+            )
+            ws_list = list_recent_workspaces(
+                session.workspace,
+                self.ide_store_dir,
+                self.cli_store_dir,
+                self.codex_store_dir,
+                preloaded_items=scanned,
+            )
+            return scanned, ws_list
+
+        items, workspaces = await asyncio.to_thread(_collect_items_and_workspaces)
         # Hide internal CLI continuation child conversations that are already merged into their parent PC chat
         hidden_cont_ids = set(self._continuation_map.values())
         visible_items = []
@@ -1772,13 +1892,6 @@ class WebPwaServer:
                 d["running"] = True
             visible_items.append(d)
 
-        workspaces = await asyncio.to_thread(
-            list_recent_workspaces,
-            session.workspace,
-            self.ide_store_dir,
-            self.cli_store_dir,
-            self.codex_store_dir,
-        )
         active_cid_for_list, _ = self._effective_slot_identity(self._active_slot, session)
         await self._safe_send(
             ws,
@@ -1813,6 +1926,10 @@ class WebPwaServer:
             self.ide_store_dir,
             self.cli_store_dir,
             self.codex_store_dir,
+            self.dsh_store_dir,
+            self.workbuddy_store_dir,
+            self.copilot_store_dir,
+            self._api_sessions_dir,
         )
         if not only_refresh and nav_token != self._nav_seq:
             return
@@ -1842,7 +1959,7 @@ class WebPwaServer:
                             detail.conversation_id, workspace=detail.workspace, title=detail.title
                         )
                     self._ide_watch_sig = ("", "", 0, 0)
-                else:
+                elif detail.store in {"ide", "codex"}:
                     handoff = build_ide_handoff_context(detail)
                     if session.linked_ide_id != detail.conversation_id:
                         await session.attach_ide_conversation(
@@ -1865,6 +1982,15 @@ class WebPwaServer:
                     if nav_token != self._nav_seq:
                         return
                     self._ide_watch_sig = (detail.store, detail.conversation_id, sig[0], sig[1])
+                else:
+                    await session.attach_ide_conversation(
+                        detail.conversation_id,
+                        handoff_context="",
+                        workspace=detail.workspace,
+                        title=detail.title,
+                        store=detail.store,
+                    )
+                    self._ide_watch_sig = ("", "", 0, 0)
 
         # If this slot already has an in-memory turn running, keep its live history intact!
         if slot_is_running and self._slot_history.get(slot_key):
@@ -1985,11 +2111,35 @@ class WebPwaServer:
         elif req_target == "cli":
             store_mode = "cli"
             title_label = "新建远程会话"
+        else:
+            ag_spec = self.agent_registry.get_agent(req_target)
+            if ag_spec is not None and ag_spec.kind in {"native_cli", "openai_api"}:
+                store_mode = ag_spec.store
+                title_label = f"新建 {ag_spec.name} 对话"
+                toast_note = f"已切换至 {ag_spec.name}"
+                await session.attach_ide_conversation(
+                    "",
+                    handoff_context="",
+                    workspace=str(session.workspace),
+                    title=title_label,
+                    store=store_mode,
+                )
 
         self._active_slot = new_slot
         self._slot_history[new_slot] = []
         self._slot_meta[new_slot] = {"conversation_id": "", "title": title_label, "store": store_mode}
         self._ide_watch_sig = ("", "", 0, 0)
+
+        ag_disp = self.agent_registry.get_agent(store_mode)
+        model_disp = (
+            "Antigravity 电脑端"
+            if store_mode == "ide"
+            else (
+                "Codex 电脑端"
+                if store_mode == "codex"
+                else (ag_disp.name if ag_disp and store_mode != "cli" else (session.model or "default"))
+            )
+        )
 
         await self._broadcast(
             {
@@ -2005,11 +2155,7 @@ class WebPwaServer:
             {
                 "type": "meta_update",
                 "slot": new_slot,
-                "model": (
-                    "Antigravity 电脑端"
-                    if store_mode == "ide"
-                    else ("Codex 电脑端" if store_mode == "codex" else (session.model or "default"))
-                ),
+                "model": model_disp,
                 "workspace": str(session.workspace),
                 "active_conversation_id": "",
                 "active_title": title_label,
@@ -2628,7 +2774,130 @@ class WebPwaServer:
             except OSError:
                 pass
 
-    async def _handle_chat(self, ws: ServerConnection, msg: dict[str, Any], chat_slot: str) -> None:
+    async def _try_run_ecosystem_agent_turn(
+        self,
+        *,
+        chat_slot: str,
+        store: str,
+        conv_id: str,
+        workspace: Path,
+        prompt_text: str,
+        conn_epoch: int,
+        on_delta: Callable[[str], Any],
+        on_reset: Callable[[], Any],
+        on_tool: Callable[[str], Any],
+        on_status: Callable[[str], Any],
+    ) -> TurnResult | None:
+        spec = self.agent_registry.get_agent(store)
+        if spec is None or spec.kind not in {"native_cli", "openai_api"}:
+            return None
+        if not spec.configured:
+            return TurnResult(
+                response="",
+                status="ERROR",
+                error=f"{spec.name} 尚未配置或未在本机就绪：{spec.description}",
+                conversation_id=conv_id,
+                active_model=spec.name,
+            )
+
+        comp_key = make_composite_slot_key(store, str(workspace), conv_id or chat_slot)
+        cancel_ev = asyncio.Event()
+        with self._revoke_exec_lock:
+            if not self.auth.is_epoch_active(conn_epoch):
+                return TurnResult(response="", status="CANCELLED", error="配对已撤销", conversation_id=conv_id, active_model=spec.name)
+            if conv_id and comp_key in self._inflight_comp_keys:
+                return TurnResult(response="", status="ERROR", error=f"该 {spec.name} 会话正在另一路执行中，请稍候再试", conversation_id=conv_id, active_model=spec.name)
+            if conv_id:
+                self._inflight_comp_keys.add(comp_key)
+            self._active_agent_cancels[chat_slot] = cancel_ev
+
+        discovered_sid = conv_id
+        had_text = {"v": False}
+
+        async def _cb_session(new_sid: str) -> None:
+            nonlocal discovered_sid
+            if new_sid:
+                discovered_sid = new_sid
+
+        async def _cb_delta(d: str) -> None:
+            had_text["v"] = True
+            await on_delta(d)
+
+        async def _cb_tool(tname: str, detail: str) -> None:
+            await on_status(f"{spec.name} 正在调用 {tname}...")
+            await on_tool(tname)
+
+        async def _cb_demote() -> None:
+            if had_text["v"]:
+                await on_reset()
+                had_text["v"] = False
+
+        async def _cb_proc_start(p: asyncio.subprocess.Process) -> None:
+            with self._revoke_exec_lock:
+                self._active_agent_procs[chat_slot] = p
+                if not self.auth.is_epoch_active(conn_epoch):
+                    cancel_ev.set()
+
+        async def _cb_proc_done(_p: asyncio.subprocess.Process) -> None:
+            with self._revoke_exec_lock:
+                self._active_agent_procs.pop(chat_slot, None)
+
+        cbs = AgentTurnCallbacks(
+            on_session=_cb_session,
+            on_delta=_cb_delta,
+            on_thought=None,
+            on_tool=_cb_tool,
+            on_demote_to_thought=_cb_demote,
+            on_proc_started=_cb_proc_start,
+            on_proc_finished=_cb_proc_done,
+        )
+
+        try:
+            await on_status(f"正在连接 {spec.name}...")
+            if spec.kind == "native_cli":
+                install_info = dict(spec.internal_meta.get("install") or {})
+                res: AgentRunResult = await run_cli_agent_turn(
+                    store=store,
+                    install_info=install_info,
+                    prompt=prompt_text,
+                    workspace=workspace,
+                    session_id=conv_id,
+                    allow_write=bool(self.config.stayy_allow_agent_write),
+                    timeout_sec=float(max(30, self.config.agy_timeout_seconds)),
+                    cancel_event=cancel_ev,
+                    callbacks=cbs,
+                )
+            else:
+                meta = spec.internal_meta
+                res = await run_openai_compat_turn(
+                    store=store,
+                    base_url=str(meta.get("base_url") or ""),
+                    api_key=str(meta.get("api_key") or ""),
+                    model=str(meta.get("model") or ""),
+                    prompt=prompt_text,
+                    workspace=str(workspace),
+                    session_id=conv_id,
+                    system_prompt=self.config.build_session_instructions(),
+                    runtime_dir=(self._api_sessions_dir.parent if self._api_sessions_dir is not None else self.runtime_dir),
+                    allow_local_ports=self.config.stayy_allow_local_llm_ports,
+                    total_timeout_sec=float(max(30, self.config.agy_timeout_seconds)),
+                    cancel_event=cancel_ev,
+                    callbacks=cbs,
+                )
+            final_sid = res.session_id or discovered_sid or conv_id
+            if res.aborted:
+                return TurnResult(status="CANCELLED", response=res.text, error=res.error, conversation_id=final_sid, active_model=spec.name)
+            if not res.ok:
+                return TurnResult(status="ERROR", response=res.text, error=res.error, conversation_id=final_sid, active_model=spec.name)
+            return TurnResult(status="SUCCESS", response=res.text, conversation_id=final_sid, active_model=spec.name)
+        finally:
+            with self._revoke_exec_lock:
+                if self._active_agent_cancels.get(chat_slot) is cancel_ev:
+                    self._active_agent_cancels.pop(chat_slot, None)
+                    self._active_agent_procs.pop(chat_slot, None)
+                self._inflight_comp_keys.discard(comp_key)
+
+    async def _handle_chat(self, ws: ServerConnection, msg: dict[str, Any], chat_slot: str, *, conn_epoch: int = 0) -> None:
         raw_text = str(msg.get("text") or "").strip()
         explicit_client_id = str(msg.get("client_id") or "").strip()
         client_id = explicit_client_id or f"u-{uuid.uuid4().hex[:10]}"
@@ -2663,7 +2932,7 @@ class WebPwaServer:
         slot_cid = str(slot_meta.get("conversation_id") or session.linked_ide_id or "")
         if (not slot_store or not slot_cid) and ":" in chat_slot:
             pfx, rest_cid = chat_slot.split(":", 1)
-            if pfx in {"ide", "codex", "cli"} and rest_cid:
+            if pfx in self.agent_registry.all_known_chat_stores() and rest_cid:
                 slot_store = slot_store or pfx
                 slot_cid = slot_cid or rest_cid
                 self._slot_meta.setdefault(
@@ -2865,10 +3134,19 @@ class WebPwaServer:
             slot_title = str(slot_meta.get("title") or session.active_title or "")
 
             reply_id = f"a-{uuid.uuid4().hex[:10]}"
+            ag_meta_spec = self.agent_registry.get_agent(slot_store)
             initial_model_label = (
                 "Antigravity 电脑端"
                 if slot_store == "ide"
-                else ("Codex 电脑端" if slot_store == "codex" else (session.model or "default"))
+                else (
+                    "Codex 电脑端"
+                    if slot_store == "codex"
+                    else (
+                        ag_meta_spec.name
+                        if ag_meta_spec and slot_store != "cli"
+                        else (session.model or "default")
+                    )
+                )
             )
             inflight_state: dict[str, Any] = {
                 "msg_id": reply_id,
@@ -3077,6 +3355,57 @@ class WebPwaServer:
                                     }
                                 )
 
+                # 3b. Plugin Ecosystem Multi-Agents (`dsh`, `workbuddy`, `copilot`, `doubao_api`, `deepseek_api`, `ollama`, `api:*`)
+                elif slot_store and slot_store not in {"ide", "codex", "cli"}:
+                    eff_epoch = conn_epoch if conn_epoch > 0 else self.auth.current_epoch()
+                    eco_out = await self._try_run_ecosystem_agent_turn(
+                        chat_slot=chat_slot,
+                        store=slot_store,
+                        conv_id=slot_cid,
+                        workspace=session.workspace,
+                        prompt_text=prompt_text,
+                        conn_epoch=eff_epoch,
+                        on_delta=_on_delta,
+                        on_reset=_on_reset,
+                        on_tool=_on_tool,
+                        on_status=_on_status,
+                    )
+                    if eco_out is not None:
+                        result = eco_out
+                        pc_direct_persisted = True
+                        await self._broadcast(
+                            {
+                                "type": "chat_ack",
+                                "client_id": client_id,
+                                "slot": chat_slot,
+                                "stage": "delivered_pc",
+                                "label": f"✓ 已交由 {eco_out.active_model or slot_store} 处理",
+                            }
+                        )
+                        if eco_out.conversation_id and (not slot_cid or slot_cid != eco_out.conversation_id):
+                            ag_label = eco_out.active_model or slot_store
+                            new_title = raw_text[:38] or f"{ag_label} 对话"
+                            meta_cur = self._slot_meta.setdefault(chat_slot, {})
+                            meta_cur["conversation_id"] = eco_out.conversation_id
+                            meta_cur["store"] = slot_store
+                            meta_cur["title"] = new_title
+                            session.linked_ide_id = eco_out.conversation_id
+                            session.linked_store = slot_store
+                            session.active_title = new_title
+                            if self._active_slot == chat_slot:
+                                await self._broadcast(
+                                    {
+                                        "type": "meta_update",
+                                        "slot": chat_slot,
+                                        "model": ag_label,
+                                        "workspace": str(session.workspace),
+                                        "active_conversation_id": eco_out.conversation_id,
+                                        "active_title": new_title,
+                                        "active_store": slot_store,
+                                        "busy": True,
+                                    }
+                                )
+
                 # 4. Fallback to standalone `agy.exe` session when in a mobile/CLI chat or when PC desktop app is closed
                 if result is None:
                     final_mid_chk = str(inflight_state.get("msg_id") or reply_id)
@@ -3193,6 +3522,12 @@ class WebPwaServer:
             has_next_queued = bool(fq_after)
             if not has_next_queued and self._slot_inflight.get(chat_slot) is inflight_state:
                 self._slot_inflight.pop(chat_slot, None)
+                if was_brand_new and self._clients:
+                    for cli_ws in list(self._clients):
+                        try:
+                            await self._handle_list_conversations(cli_ws)
+                        except Exception:
+                            pass
 
             if self._active_slot == chat_slot:
                 await self._broadcast(
@@ -3236,14 +3571,6 @@ class WebPwaServer:
                 preset_baseline = None
                 continue
             break
-
-        # Refresh conversation sidebar list whenever a brand-new conversation finished its first turn
-        if was_brand_new and self._clients:
-            for cli_ws in list(self._clients):
-                try:
-                    await self._handle_list_conversations(cli_ws)
-                except Exception:
-                    pass
 
     async def _send_sys_reply(
         self, slot_key: str, text: str, model: str = "", images: list[dict] | None = None
