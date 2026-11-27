@@ -1,0 +1,62 @@
+name: CI
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+
+jobs:
+  test-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Install locked dependencies
+        run: uv sync --locked
+
+      - name: Bytecode compilation check
+        run: uv run --no-sync python -X utf8 -m compileall -q src tests
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Verify inline JS syntax in static/index.html
+        shell: pwsh
+        run: |
+          $html = Get-Content -Raw -Encoding UTF8 "src/stayy/static/index.html"
+          $scriptMatches = [regex]::Matches($html, '(?s)<script(?![^>]*\bsrc=)[^>]*>(.*?)</script>')
+          if ($scriptMatches.Count -eq 0) { throw "Inline <script> not found" }
+          $idx = 0
+          foreach ($m in $scriptMatches) {
+            $p = Join-Path $env:TEMP ("inline_check_" + $idx + ".js")
+            [System.IO.File]::WriteAllText($p, $m.Groups[1].Value, [System.Text.UTF8Encoding]::new($false))
+            node --check $p
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            $idx++
+          }
+
+      - name: Run pytest suite
+        run: uv run --no-sync pytest -v
+
+      - name: Verify pip editable [dev] extra includes pytest
+        shell: pwsh
+        run: |
+          python -m venv .venv-pip-check
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          .\.venv-pip-check\Scripts\python.exe -m pip install -e ".[dev]"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          .\.venv-pip-check\Scripts\python.exe -m pytest --version
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
