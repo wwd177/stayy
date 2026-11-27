@@ -1026,6 +1026,8 @@ async def test_duplicate_inflight_chat_guard_and_new_codex_thread(tmp_path: Path
     mock_codex_py = tmp_path / "mock_codex.py"
     mock_codex_py.write_text(
         "import json, sys\n"
+        "sys.stdin.reconfigure(encoding='utf-8', errors='replace')\n"
+        "sys.stdout.reconfigure(encoding='utf-8', errors='replace')\n"
         "prompt = sys.stdin.read().strip()\n"
         f"open({str(rollout)!r}, 'w', encoding='utf-8').write("
         f"json.dumps({{'type':'response_item','payload':{{'type':'message','role':'user','content':[{{'type':'input_text','text':prompt}}]}}}}, ensure_ascii=False) + '\\n')\n"
@@ -1035,9 +1037,9 @@ async def test_duplicate_inflight_chat_guard_and_new_codex_thread(tmp_path: Path
     )
     mock_codex_cmd = tmp_path / ("mock_codex.cmd" if sys.platform == "win32" else "mock_codex.sh")
     if sys.platform == "win32":
-        mock_codex_cmd.write_text(f'@chcp 65001 >nul\r\n@"{sys.executable}" "{mock_codex_py}" %*\r\n', encoding="utf-8")
+        mock_codex_cmd.write_text(f'@chcp 65001 >nul\r\n@"{sys.executable}" -X utf8 "{mock_codex_py}" %*\r\n', encoding="utf-8")
     else:
-        mock_codex_cmd.write_text(f'#!/bin/sh\nexec "{sys.executable}" "{mock_codex_py}" "$@"\n', encoding="utf-8")
+        mock_codex_cmd.write_text(f'#!/bin/sh\nexec "{sys.executable}" -X utf8 "{mock_codex_py}" "$@"\n', encoding="utf-8")
         mock_codex_cmd.chmod(0o755)
 
     con_cdx = sqlite3.connect(codex_dir / "state_5.sqlite")
@@ -1173,6 +1175,8 @@ async def test_security_cswsh_port_identity_codex_reconnect_and_no_double_exec(t
     mock_cdx_fail_py = tmp_path / "mock_cdx_midfail.py"
     mock_cdx_fail_py.write_text(
         "import json, sys, time\n"
+        "sys.stdin.reconfigure(encoding='utf-8', errors='replace')\n"
+        "sys.stdout.reconfigure(encoding='utf-8', errors='replace')\n"
         "_ = sys.stdin.read()\n"
         "print(json.dumps({'type':'thread.started','thread_id':'cdx-midfail-999'}), flush=True)\n"
         "sys.stderr.write('simulated mid-turn failure after thread started\\n')\n"
@@ -1183,9 +1187,9 @@ async def test_security_cswsh_port_identity_codex_reconnect_and_no_double_exec(t
     )
     mock_cdx_cmd = tmp_path / ("mock_cdx_midfail.cmd" if sys.platform == "win32" else "mock_cdx_midfail.sh")
     if sys.platform == "win32":
-        mock_cdx_cmd.write_text(f'@chcp 65001 >nul\r\n@"{sys.executable}" "{mock_cdx_fail_py}" %*\r\n', encoding="utf-8")
+        mock_cdx_cmd.write_text(f'@chcp 65001 >nul\r\n@"{sys.executable}" -X utf8 "{mock_cdx_fail_py}" %*\r\n', encoding="utf-8")
     else:
-        mock_cdx_cmd.write_text(f'#!/bin/sh\nexec "{sys.executable}" "{mock_cdx_fail_py}" "$@"\n', encoding="utf-8")
+        mock_cdx_cmd.write_text(f'#!/bin/sh\nexec "{sys.executable}" -X utf8 "{mock_cdx_fail_py}" "$@"\n', encoding="utf-8")
         mock_cdx_cmd.chmod(0o755)
 
     tok = "astra-redteam-token-999"

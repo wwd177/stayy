@@ -874,6 +874,8 @@ def test_e2_desktop_app_pe_guards_junction_drift_and_uac(tmp_path: Path, monkeyp
     assert "../evil" not in discovered
     entry = discovered["fake_doubao"]
 
+    monkeypatch.setattr("stayy.agents.desktop_apps.is_process_elevated", lambda: False)
+
     # Reject bad app_id
     ok_bad, _, _ = launch_desktop_ai_app("../evil", entry)
     assert not ok_bad
