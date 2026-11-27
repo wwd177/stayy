@@ -198,37 +198,97 @@ def _running_process_names_win32() -> set[str]:
 
 
 def _focus_window_by_process_win32(process_stem: str) -> bool:
-    """Best-effort bring an existing visible window matching `process_stem` to foreground and verify focus."""
-    if sys.platform != "win32":
+    """Bring a visible window belonging to `process_stem` to foreground cleanly using pure Win32 ctypes."""
+    if sys.platform != "win32" or not (process_stem or "").strip():
         return False
-    ps = (
-        "Add-Type -MemberDefinition '[DllImport(\"user32.dll\")] public static extern IntPtr GetForegroundWindow(); "
-        "[DllImport(\"user32.dll\")] public static extern bool SetForegroundWindow(IntPtr hWnd); "
-        "[DllImport(\"user32.dll\")] public static extern bool ShowWindowAsync(IntPtr hWnd, int nCmdShow);' "
-        "-Name StayyAppFocus -Namespace Win32; "
-        f"$target = Get-Process -Name '{process_stem.replace(chr(39), chr(39)*2)}' -ErrorAction SilentlyContinue | Where-Object {{ $_.MainWindowHandle -ne 0 }} | Select-Object -First 1; "
-        "if ($null -eq $target) { Write-Output 'NONE'; exit 0 }; "
-        "$h = $target.MainWindowHandle; "
-        "[Win32.StayyAppFocus]::ShowWindowAsync($h, 9) | Out-Null; "
-        "[Win32.StayyAppFocus]::SetForegroundWindow($h) | Out-Null; "
-        "Start-Sleep -Milliseconds 90; "
-        "$fg = [Win32.StayyAppFocus]::GetForegroundWindow(); "
-        "if ($fg -eq $h) { Write-Output 'FOCUSED' } else { Write-Output 'UNFOCUSED' }"
-    )
-    import base64
-
-    enc = base64.b64encode(ps.encode("utf-16-le")).decode("ascii")
     try:
-        res = subprocess.run(
-            ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-EncodedCommand", enc],
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=5,
-            creationflags=CREATE_NO_WINDOW,
-        )
-        return "FOCUSED" in (res.stdout or "")
+        import ctypes
+        from ctypes import wintypes
+
+        target_stem = process_stem.strip().lower()
+        user32 = ctypes.windll.user32
+        kernel32 = ctypes.windll.kernel32
+
+        user32.IsWindowVisible.argtypes = [wintypes.HWND]
+        user32.IsWindowVisible.restype = wintypes.BOOL
+        user32.GetWindowTextLengthW.argtypes = [wintypes.HWND]
+        user32.GetWindowTextLengthW.restype = ctypes.c_int
+        user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+        user32.GetWindowThreadProcessId.restype = wintypes.DWORD
+        user32.IsIconic.argtypes = [wintypes.HWND]
+        user32.IsIconic.restype = wintypes.BOOL
+        user32.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
+        user32.ShowWindow.restype = wintypes.BOOL
+        user32.SetForegroundWindow.argtypes = [wintypes.HWND]
+        user32.SetForegroundWindow.restype = wintypes.BOOL
+        user32.BringWindowToTop.argtypes = [wintypes.HWND]
+        user32.BringWindowToTop.restype = wintypes.BOOL
+        user32.GetForegroundWindow.argtypes = []
+        user32.GetForegroundWindow.restype = wintypes.HWND
+
+        kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        kernel32.QueryFullProcessImageNameW.argtypes = [
+            wintypes.HANDLE,
+            wintypes.DWORD,
+            wintypes.LPWSTR,
+            ctypes.POINTER(wintypes.DWORD),
+        ]
+        kernel32.QueryFullProcessImageNameW.restype = wintypes.BOOL
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel32.CloseHandle.restype = wintypes.BOOL
+
+        WNDENUMPROC = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+        user32.EnumWindows.argtypes = [WNDENUMPROC, wintypes.LPARAM]
+        user32.EnumWindows.restype = wintypes.BOOL
+
+        titled_hwnds: list[int] = []
+        fallback_hwnds: list[int] = []
+        proc_stem_cache: dict[int, str] = {}
+
+        def _enum_cb(hwnd: int, _lparam: int) -> bool:
+            if not user32.IsWindowVisible(hwnd):
+                return True
+            pid = wintypes.DWORD(0)
+            user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+            pid_val = int(pid.value)
+            if pid_val <= 0:
+                return True
+            stem = proc_stem_cache.get(pid_val)
+            if stem is None:
+                stem = ""
+                hproc = kernel32.OpenProcess(0x1000, False, pid_val)  # PROCESS_QUERY_LIMITED_INFORMATION
+                if hproc:
+                    try:
+                        buf = ctypes.create_unicode_buffer(520)
+                        sz = wintypes.DWORD(520)
+                        if kernel32.QueryFullProcessImageNameW(hproc, 0, buf, ctypes.byref(sz)):
+                            stem = Path(buf.value).stem.lower()
+                    finally:
+                        kernel32.CloseHandle(hproc)
+                proc_stem_cache[pid_val] = stem
+            if stem == target_stem:
+                if user32.GetWindowTextLengthW(hwnd) > 0:
+                    titled_hwnds.append(hwnd)
+                    return False
+                fallback_hwnds.append(hwnd)
+            return True
+
+        cb_ref = WNDENUMPROC(_enum_cb)
+        user32.EnumWindows(cb_ref, 0)
+        cand = titled_hwnds[0] if titled_hwnds else (fallback_hwnds[0] if fallback_hwnds else 0)
+        if not cand:
+            return False
+
+        if user32.IsIconic(cand):
+            user32.ShowWindow(cand, 9)  # SW_RESTORE
+        # Legal Alt key press/release satisfies ForegroundLock check when switching between user windows
+        user32.keybd_event(0x12, 0, 0, 0)
+        user32.keybd_event(0x12, 0, 0x0002, 0)
+        user32.BringWindowToTop(cand)
+        user32.SetForegroundWindow(cand)
+        time.sleep(0.06)
+        return int(user32.GetForegroundWindow() or 0) == int(cand)
     except Exception:
         return False
 
@@ -263,6 +323,7 @@ def discover_desktop_ai_apps(
             "exe_size": exe_size,
             "exe_digest": exe_digest,
             "process_stem": found_exe.stem,
+            "process_names": pnames,
             "running": any(pn in running_imgs for pn in pnames) or found_exe.name.lower() in running_imgs,
         }
 
@@ -287,6 +348,7 @@ def discover_desktop_ai_apps(
             "exe_size": exe_size,
             "exe_digest": exe_digest,
             "process_stem": resolved.stem,
+            "process_names": (resolved.name.lower(),),
             "running": resolved.name.lower() in running_imgs,
         }
 
@@ -301,6 +363,8 @@ def launch_desktop_ai_app(
 
     Returns `(ok, focused, human_note)`.
     """
+    import time
+
     if not APP_ID_RE.match((app_id or "").strip()):
         return False, False, "非法的应用标识符"
     if registered_entry is None:
@@ -326,13 +390,27 @@ def launch_desktop_ai_app(
             return False, False, f"{registered_entry.get('name', app_id)} 程序内容自发现后发生变化，已拦截启动，请先刷新列表"
 
     stem = str(registered_entry.get("process_stem") or exe_path.stem)
+    pnames = tuple(registered_entry.get("process_names") or (exe_path.name.lower(),))
     running_imgs = _running_process_names_win32()
-    already_running = exe_path.name.lower() in running_imgs
+    already_running = exe_path.name.lower() in running_imgs or any(pn in running_imgs for pn in pnames)
 
     if already_running:
         focused = _focus_window_by_process_win32(stem)
         if focused:
             return True, True, f"已将「{registered_entry['name']}」置前到电脑屏幕，请在放大镜中操作"
+        # App may be minimized to system tray without a visible HWND: wake single-instance window cleanly
+        try:
+            subprocess.Popen(
+                [str(exe_path)],
+                cwd=str(exe_path.parent),
+                close_fds=True,
+            )
+            for _ in range(4):
+                time.sleep(0.25)
+                if _focus_window_by_process_win32(stem):
+                    return True, True, f"已唤醒并将「{registered_entry['name']}」置前到电脑屏幕，请在放大镜中操作"
+        except Exception:
+            pass
         return True, False, f"「{registered_entry['name']}」已在运行但未能自动置前（已保持画面只读提示，请切屏核对）"
 
     try:
@@ -344,7 +422,12 @@ def launch_desktop_ai_app(
     except Exception as exc:
         return False, False, f"启动「{registered_entry['name']}」失败：{exc}"
 
-    focused = _focus_window_by_process_win32(stem)
+    focused = False
+    for _ in range(6):
+        time.sleep(0.25)
+        if _focus_window_by_process_win32(stem):
+            focused = True
+            break
     return (
         True,
         focused,

@@ -1481,7 +1481,7 @@ async def test_chatgpt_ios_ui_steps_timeline_and_canvas_sandbox(tmp_path: Path):
     from stayy.web_pwa import STATIC_DIR
 
     assert "CACHE_PREFIX = 'stayy-ios-shell-' + SCOPE_SLUG + '-'" in STATIC_PWA_SW_JS
-    assert "CACHE_NAME = CACHE_PREFIX + 'v2'" in STATIC_PWA_SW_JS
+    assert "CACHE_NAME = CACHE_PREFIX + 'v3'" in STATIC_PWA_SW_JS
     assert "REQUIRED_SHELL = ['./', './index.html']" in STATIC_PWA_SW_JS
     assert "Promise.allSettled(OPTIONAL_ASSETS" in STATIC_PWA_SW_JS
     html = (STATIC_DIR / "index.html").read_text(encoding="utf-8")

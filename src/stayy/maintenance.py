@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -25,7 +26,6 @@ QUOTA_ERROR_KEYWORDS: tuple[str, ...] = (
     "rate_limit",
     "ratelimit",
     "too many requests",
-    "429",
     "usage limit",
     "limit reached",
     "limit exceeded",
@@ -35,7 +35,6 @@ QUOTA_ERROR_KEYWORDS: tuple[str, ...] = (
     "overloaded",
     "model is overloaded",
     "service unavailable",
-    "503",
     "model unavailable",
     "model not available",
     "额度",
@@ -43,6 +42,13 @@ QUOTA_ERROR_KEYWORDS: tuple[str, ...] = (
     "次数已达上限",
     "请求过多",
     "容量不足",
+)
+
+QUOTA_STATUS_RE = re.compile(
+    r"\b(?:http(?:/[\d.]+)?|status(?:\s+code)?|status_code|code|error(?:\s+code)?)\s*[:=#(\s-]{1,4}\b(?:429|503)\b"
+    r"|\(\s*(?:429|503)\s*\)"
+    r"|\b(?:429|503)\s*[:=-]?\s*(?:too many|service unavailable|rate|quota|overloaded)\b",
+    re.IGNORECASE,
 )
 
 NON_QUOTA_EXCLUSIONS: tuple[str, ...] = (
@@ -62,7 +68,9 @@ def is_quota_or_capacity_error(error_text: str, stderr_text: str = "") -> bool:
         return False
     if any(excl in combined for excl in NON_QUOTA_EXCLUSIONS):
         return False
-    return any(kw in combined for kw in QUOTA_ERROR_KEYWORDS)
+    if any(kw in combined for kw in QUOTA_ERROR_KEYWORDS):
+        return True
+    return bool(QUOTA_STATUS_RE.search(combined))
 
 
 class ModelFailoverPool:

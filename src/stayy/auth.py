@@ -161,22 +161,24 @@ def write_admin_state(runtime_dir: Path, port: int, admin_token: str, pid: int) 
     """Persist loopback-only admin API coordinates with strict pre-write ACL restriction."""
     restrict_directory_to_current_user(runtime_dir)
     admin_file = runtime_dir / "admin.json"
-    if admin_file.exists():
-        try:
-            admin_file.unlink()
-        except OSError:
-            pass
     payload = json.dumps(
         {"port": int(port), "admin_token": admin_token, "pid": int(pid), "service": "stayy"},
         ensure_ascii=False,
         indent=2,
     )
     tmp = admin_file.with_name(f".admin.{secrets.token_hex(4)}.tmp")
-    # Create empty file inside ACL-locked runtime_dir and restrict its ACL BEFORE writing secret!
-    tmp.write_text("", encoding="utf-8")
-    restrict_file_to_current_user(tmp)
-    tmp.write_text(payload + "\n", encoding="utf-8")
-    os.replace(tmp, admin_file)
+    try:
+        # Create empty file inside ACL-locked runtime_dir and restrict its ACL BEFORE writing secret!
+        tmp.write_text("", encoding="utf-8")
+        restrict_file_to_current_user(tmp)
+        tmp.write_text(payload + "\n", encoding="utf-8")
+        os.replace(tmp, admin_file)
+    except Exception:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
     ok_acl, info = restrict_file_to_current_user(admin_file)
     if not ok_acl:
         logger.warning("Failed to restrict ACL on admin.json (%s): %s", admin_file, info)

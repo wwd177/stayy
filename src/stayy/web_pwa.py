@@ -7,6 +7,7 @@ import base64
 import hmac
 import json
 import logging
+import math
 import mimetypes
 import os
 import re
@@ -603,10 +604,12 @@ class WebPwaServer:
         self._client_epochs: dict[ServerConnection, int] = {}
         self._clients_lock = asyncio.Lock()
         self._media_registry: OrderedDict[str, Path] = OrderedDict()
+        self._live_frame_registry: OrderedDict[str, Path] = OrderedDict()
         self._tasks: set[asyncio.Task[None]] = set()
 
         # Shared single-producer live-screen coordinator with bounded 1-frame subscriber queues
         self._screen_subs: dict[ServerConnection, asyncio.Queue[dict[str, Any]]] = {}
+        self._screen_sub_intervals: dict[ServerConnection, float] = {}
         self._screen_sender_tasks: dict[ServerConnection, asyncio.Task[None]] = {}
         self._screen_producer_task: asyncio.Task[None] | None = None
         self._screen_interval: float = 0.75
@@ -636,6 +639,7 @@ class WebPwaServer:
         self._nav_seq: int = 0
         self._watch_gen: int = 0
         self._ide_watch_sig: tuple[str, str, int, int] = ("", "", 0, 0)
+        self._last_bark_scan_mono: float = 0.0
         self.pc_ide_poll_interval: float = 0.55
         self.pc_ide_accept_timeout: float = 10.0
         self._revoke_exec_lock = threading.Lock()
@@ -868,6 +872,61 @@ class WebPwaServer:
         item.update(extra)
         return item
 
+    def register_live_frame(self, path: Path) -> str:
+        resolved = path.resolve()
+        for existing_id, existing_path in self._live_frame_registry.items():
+            if existing_path == resolved:
+                self._live_frame_registry.move_to_end(existing_id)
+                return existing_id
+        frame_id = f"lf-{uuid.uuid4().hex}"
+        self._live_frame_registry[frame_id] = resolved
+        while len(self._live_frame_registry) > 24:
+            self._live_frame_registry.popitem(last=False)
+        return frame_id
+
+    def _live_frame_ref(self, path: Path, **extra: Any) -> dict[str, Any]:
+        fid = self.register_live_frame(path)
+        item: dict[str, Any] = {
+            "media_id": fid,
+            "media_ticket": self.auth.issue_media_ticket(fid),
+        }
+        item.update(extra)
+        return item
+
+    def _display_model_for_store(self, store: str, fallback: str = "default") -> str:
+        if store == "ide":
+            return "Antigravity 电脑端"
+        if store == "codex":
+            return "Codex 电脑端"
+        if store and store != "cli":
+            ag = self.agent_registry.get_agent(store)
+            if ag is not None and ag.name:
+                return ag.name
+            return store
+        return fallback or "default"
+
+    @staticmethod
+    def _safe_int_param(val: Any, default: int, *, min_val: int, max_val: int) -> int:
+        if val is None or isinstance(val, bool):
+            return default
+        try:
+            n = int(val)
+        except (TypeError, ValueError):
+            return default
+        return max(min_val, min(max_val, n))
+
+    @staticmethod
+    def _safe_float_param(val: Any, default: float, *, min_val: float, max_val: float) -> float:
+        if val is None or isinstance(val, bool):
+            return default
+        try:
+            f = float(val)
+        except (TypeError, ValueError):
+            return default
+        if not math.isfinite(f):
+            return default
+        return max(min_val, min(max_val, f))
+
     async def revoke_all_tokens(self) -> tuple[bool, int, int]:
         """Atomically rotate master token, increment epoch, clear caches, and disconnect stale WS clients."""
         ok, _result_or_err, new_epoch = self.auth.revoke_and_rotate(self.env_path)
@@ -877,15 +936,27 @@ class WebPwaServer:
         with self._revoke_exec_lock:
             cancels = list(self._active_agent_cancels.values())
             procs = list(self._active_agent_procs.values())
+            codex_procs = list(self._slot_codex_procs.values())
+            self._slot_followup_queue.clear()
+            for sk in list(self._slot_inflight.keys()):
+                inf_ep = int(self._slot_inflight[sk].get("auth_epoch") or 0)
+                if not self.auth.is_epoch_active(inf_ep):
+                    self._slot_inflight.pop(sk, None)
         for cev in cancels:
             cev.set()
-        for p in procs:
+        for p in [*procs, *codex_procs]:
             if p.returncode is None and p.pid:
                 await asyncio.to_thread(kill_pid_tree_sync, p.pid)
+        if hasattr(self.sessions, "shutdown_all"):
+            try:
+                await asyncio.wait_for(self.sessions.shutdown_all(), timeout=2.0)
+            except Exception:
+                pass
 
         stale_ws: list[ServerConnection] = []
         async with self._clients_lock:
             self._media_registry.clear()
+            self._live_frame_registry.clear()
             self._approval_tracker.clear()
             for cli in list(self._clients):
                 ep = self._client_epochs.get(cli, 0)
@@ -953,6 +1024,7 @@ class WebPwaServer:
                 ("Content-Type", content_type),
                 ("Content-Length", str(len(body))),
                 ("X-Content-Type-Options", "nosniff"),
+                ("Connection", "close"),
             ]
         )
         if extra_headers:
@@ -1111,7 +1183,7 @@ class WebPwaServer:
                     {"Cache-Control": "no-store", **cors},
                 )
 
-            target = self._media_registry.get(media_id)
+            target = self._media_registry.get(media_id) or self._live_frame_registry.get(media_id)
             if target is None or not is_safe_outbound_file(target, image_only=False):
                 return self._http_response(
                     404,
@@ -1121,7 +1193,16 @@ class WebPwaServer:
                     {"Cache-Control": "no-store", **cors},
                 )
 
-            body = await asyncio.to_thread(target.read_bytes)
+            try:
+                body = await asyncio.to_thread(target.read_bytes)
+            except (FileNotFoundError, OSError):
+                return self._http_response(
+                    404,
+                    "Not Found",
+                    b"",
+                    "text/plain",
+                    {"Cache-Control": "no-store", **cors},
+                )
             mime, _ = mimetypes.guess_type(str(target))
             mime = mime or "application/octet-stream"
             disp_type = "inline" if mime.startswith("image/") else "attachment"
@@ -1153,6 +1234,8 @@ class WebPwaServer:
             return (str(session.linked_ide_id or "") if has_slot_activity else ""), meta_store
         if meta_store == "cli":
             return (str(session.conversation_id or "") if has_slot_activity else ""), "cli"
+        if meta_store:
+            return (str(session.linked_ide_id or "") if has_slot_activity else ""), meta_store
         if not has_slot_activity:
             default_store = "ide" if self._pc_window_new_sender is not None else ""
             return "", default_store
@@ -1246,7 +1329,7 @@ class WebPwaServer:
                     )
                     frame = {
                         "type": "desktop_frame",
-                        **self._media_ref(shot),
+                        **self._live_frame_ref(shot),
                         "ts": int(time.time() * 1000),
                         "cursor": cur_info,
                     }
@@ -1277,7 +1360,10 @@ class WebPwaServer:
     async def _subscribe_live_screen(self, ws: ServerConnection, interval: float) -> None:
         clamped = max(0.6, min(5.0, float(interval)))
         async with self._screen_lock:
-            self._screen_interval = clamped
+            self._screen_sub_intervals[ws] = clamped
+            self._screen_interval = (
+                min(self._screen_sub_intervals.values()) if self._screen_sub_intervals else clamped
+            )
             if ws not in self._screen_subs:
                 q: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=1)
                 self._screen_subs[ws] = q
@@ -1292,6 +1378,10 @@ class WebPwaServer:
         cur_task = asyncio.current_task()
         async with self._screen_lock:
             self._screen_subs.pop(ws, None)
+            self._screen_sub_intervals.pop(ws, None)
+            self._screen_interval = (
+                min(self._screen_sub_intervals.values()) if self._screen_sub_intervals else 0.75
+            )
             sender_task = self._screen_sender_tasks.pop(ws, None)
             if not self._screen_subs and self._screen_producer_task is not None:
                 prod_task = self._screen_producer_task
@@ -1365,11 +1455,7 @@ class WebPwaServer:
             meta = self._slot_meta.get(slot, {})
             active_cid, active_store = self._effective_slot_identity(slot, session)
             pub_inflight = self._public_inflight(slot)
-            hello_model = (
-                "Antigravity 电脑端"
-                if active_store == "ide"
-                else ("Codex 电脑端" if active_store == "codex" else (session.model or "default"))
-            )
+            hello_model = self._display_model_for_store(active_store, session.model or "default")
             await self._safe_send(
                 ws,
                 {
@@ -1433,7 +1519,7 @@ class WebPwaServer:
                             ws,
                             {
                                 "type": "desktop_frame",
-                                **self._media_ref(shot),
+                                **self._live_frame_ref(shot),
                                 "ts": int(time.time() * 1000),
                                 "cursor": cur_info,
                             },
@@ -1450,7 +1536,9 @@ class WebPwaServer:
                                 {"type": "toast", "level": "err", "text": "当前主机未启用远程桌面画面流", "code": "capabilities_denied"},
                             )
                             continue
-                        interval = float(msg.get("interval_ms") or 750) / 1000.0
+                        interval = self._safe_float_param(
+                            msg.get("interval_ms"), 750.0, min_val=600.0, max_val=5000.0
+                        ) / 1000.0
                         await self._subscribe_live_screen(ws, interval)
                     else:
                         await self._unsubscribe_live_screen(ws)
@@ -1463,9 +1551,9 @@ class WebPwaServer:
                     if uid in uploads:
                         uploads.pop(uid).abort()
                     safe_name = sanitize_filename(str(msg.get("name") or "upload.bin"))
-                    size = int(msg.get("size") or 0)
+                    size = self._safe_int_param(msg.get("size"), -1, min_val=-1, max_val=MAX_UPLOAD_BYTES + 1)
                     if size < 0 or size > MAX_UPLOAD_BYTES:
-                        await self._safe_send(ws, {"type": "toast", "level": "err", "text": "文件超过 100MB 上限"})
+                        await self._safe_send(ws, {"type": "toast", "level": "err", "text": "文件大小无效或超过 100MB 上限"})
                         continue
                     PROJECT_INBOX_DIR.mkdir(parents=True, exist_ok=True)
                     dest = PROJECT_INBOX_DIR / f"pwa_{int(time.time())}_{uuid.uuid4().hex[:5]}_{safe_name}"
@@ -1558,14 +1646,14 @@ class WebPwaServer:
                     await self._handle_list_conversations(ws)
 
                 elif mtype == "select_conversation":
-                    max_m = int(msg.get("max_messages") or 200)
+                    max_m = self._safe_int_param(msg.get("max_messages"), 200, min_val=50, max_val=3000)
                     t = asyncio.create_task(
                         self._handle_select_conversation(
                             ws,
                             str(msg.get("conversation_id") or ""),
                             str(msg.get("store") or "auto"),
                             only_refresh=bool(msg.get("only_refresh", False)),
-                            max_messages=max(50, min(3000, max_m)),
+                            max_messages=max_m,
                         )
                     )
                     self._tasks.add(t)
@@ -1683,7 +1771,7 @@ class WebPwaServer:
                                 ws,
                                 {
                                     "type": "desktop_frame",
-                                    **self._media_ref(shot),
+                                    **self._live_frame_ref(shot),
                                     "ts": int(time.time() * 1000),
                                     "cursor": cur_info,
                                 },
@@ -1807,11 +1895,7 @@ class WebPwaServer:
 
     def _convert_detail_to_pwa_history(self, detail: ConversationDetail, model_label: str) -> list[dict[str, Any]]:
         out: list[dict[str, Any]] = []
-        origin_tag = (
-            "Antigravity 电脑端"
-            if detail.store == "ide"
-            else ("Codex 电脑端" if detail.store == "codex" else model_label)
-        )
+        origin_tag = self._display_model_for_store(detail.store, model_label)
         for idx, m in enumerate(detail.messages):
             if m.role == "user":
                 atts = []
@@ -1855,9 +1939,8 @@ class WebPwaServer:
                 )
         return out
 
-    async def _handle_list_conversations(self, ws: ServerConnection) -> None:
+    async def _build_conversations_list_payload(self) -> dict[str, Any]:
         session = self._session_for_slot(self._active_slot)
-        meta = self._slot_meta.get(self._active_slot, {})
 
         def _collect_items_and_workspaces() -> tuple[list[ConversationItem], list[str]]:
             scanned = list_local_conversations(
@@ -1893,16 +1976,21 @@ class WebPwaServer:
             visible_items.append(d)
 
         active_cid_for_list, _ = self._effective_slot_identity(self._active_slot, session)
-        await self._safe_send(
-            ws,
-            {
-                "type": "conversations_list",
-                "active_id": active_cid_for_list,
-                "current_workspace": str(session.workspace),
-                "items": visible_items,
-                "workspaces": workspaces,
-            },
-        )
+        return {
+            "type": "conversations_list",
+            "active_id": active_cid_for_list,
+            "current_workspace": str(session.workspace),
+            "items": visible_items,
+            "workspaces": workspaces,
+        }
+
+    async def _handle_list_conversations(self, ws: ServerConnection) -> None:
+        payload = await self._build_conversations_list_payload()
+        await self._safe_send(ws, payload)
+
+    async def _broadcast_conversations_list(self) -> None:
+        payload = await self._build_conversations_list_payload()
+        await self._broadcast(payload)
 
     async def _handle_select_conversation(
         self,
@@ -2136,22 +2224,14 @@ class WebPwaServer:
         self._slot_meta[new_slot] = {"conversation_id": "", "title": title_label, "store": store_mode}
         self._ide_watch_sig = ("", "", 0, 0)
 
-        ag_disp = self.agent_registry.get_agent(store_mode)
-        model_disp = (
-            "Antigravity 电脑端"
-            if store_mode == "ide"
-            else (
-                "Codex 电脑端"
-                if store_mode == "codex"
-                else (ag_disp.name if ag_disp and store_mode != "cli" else (session.model or "default"))
-            )
-        )
+        model_disp = self._display_model_for_store(store_mode, session.model or "default")
 
         await self._broadcast(
             {
                 "type": "clear_history",
                 "nav_seq": self._nav_seq,
                 "slot": new_slot,
+                "target_store": store_mode,
                 "req_id": req_id,
                 "keep_view": silent_keep_view,
             }
@@ -2920,6 +3000,9 @@ class WebPwaServer:
                 self._inflight_comp_keys.discard(comp_key)
 
     async def _handle_chat(self, ws: ServerConnection, msg: dict[str, Any], chat_slot: str, *, conn_epoch: int = 0) -> None:
+        turn_epoch = conn_epoch if conn_epoch > 0 else self.auth.current_epoch()
+        if not self.auth.is_epoch_active(turn_epoch):
+            return
         raw_text = str(msg.get("text") or "").strip()
         explicit_client_id = str(msg.get("client_id") or "").strip()
         client_id = explicit_client_id or f"u-{uuid.uuid4().hex[:10]}"
@@ -3079,6 +3162,10 @@ class WebPwaServer:
                     )
                     return
 
+                if not self.auth.is_epoch_active(turn_epoch):
+                    self._remove_slot_local_turn(chat_slot, client_id)
+                    return
+
                 self._remove_slot_local_turn(chat_slot, client_id)
                 if self._slot_inflight.get(chat_slot) is active_inf:
                     active_inf.setdefault("steered_ack_queue", []).append(
@@ -3101,7 +3188,7 @@ class WebPwaServer:
                     return
 
                 # Previous turn finished right while we were pasting `prompt_text` into IDE -> seamlessly track the new turn!
-                if chat_slot not in self._slot_inflight:
+                if chat_slot not in self._slot_inflight and self.auth.is_epoch_active(turn_epoch):
                     already_delivered_pc = True
                     already_persisted_user = True
                     preset_baseline = int(pre_snap_st.get("total_lines") or 0)
@@ -3109,9 +3196,9 @@ class WebPwaServer:
                     return
             else:
                 # Branch B: Codex / CLI subprocess (`stdin` closed) -> FIFO queue for automatic immediate continuation!
+                if not self.auth.is_epoch_active(turn_epoch):
+                    return
                 self._append_slot_history(chat_slot, user_entry)
-                if self._active_slot == chat_slot:
-                    await self._broadcast({"type": "user_msg", "slot": chat_slot, "item": user_entry})
                 fq.append(
                     {
                         "raw_text": raw_text,
@@ -3121,6 +3208,8 @@ class WebPwaServer:
                         "client_id": client_id,
                     }
                 )
+                if self._active_slot == chat_slot:
+                    await self._broadcast({"type": "user_msg", "slot": chat_slot, "item": user_entry})
                 await self._broadcast(
                     {
                         "type": "chat_ack",
@@ -3148,7 +3237,12 @@ class WebPwaServer:
                 return
 
         was_brand_new = not bool(slot_cid)
+        prev_owned_inf: dict[str, Any] | None = None
         while True:
+            if not self.auth.is_epoch_active(turn_epoch):
+                if prev_owned_inf is not None and self._slot_inflight.get(chat_slot) is prev_owned_inf:
+                    self._slot_inflight.pop(chat_slot, None)
+                break
             # Atomically claim `self._slot_inflight[chat_slot]` BEFORE the first `await` so concurrent sends cannot slip in!
             slot_meta = self._slot_meta.get(chat_slot, {})
             slot_store = str(slot_meta.get("store") or (session.linked_store if session.linked_ide_id else ""))
@@ -3156,23 +3250,11 @@ class WebPwaServer:
             slot_title = str(slot_meta.get("title") or session.active_title or "")
 
             reply_id = f"a-{uuid.uuid4().hex[:10]}"
-            ag_meta_spec = self.agent_registry.get_agent(slot_store)
-            initial_model_label = (
-                "Antigravity 电脑端"
-                if slot_store == "ide"
-                else (
-                    "Codex 电脑端"
-                    if slot_store == "codex"
-                    else (
-                        ag_meta_spec.name
-                        if ag_meta_spec and slot_store != "cli"
-                        else (session.model or "default")
-                    )
-                )
-            )
+            initial_model_label = self._display_model_for_store(slot_store, session.model or "default")
             inflight_state: dict[str, Any] = {
                 "msg_id": reply_id,
                 "slot": chat_slot,
+                "auth_epoch": turn_epoch,
                 "model": initial_model_label,
                 "text": "",
                 "status": "正在思考...",
@@ -3180,8 +3262,21 @@ class WebPwaServer:
                 "started_ms": int(time.time() * 1000),
             }
             self._slot_inflight[chat_slot] = inflight_state
-            if not already_persisted_user and not (raw_text.startswith("/") and not attachments):
-                self._append_slot_history(chat_slot, user_entry)
+            prev_owned_inf = inflight_state
+
+            def _owns_turn(inf_obj: dict[str, Any] = inflight_state) -> bool:
+                return (
+                    self.auth.is_epoch_active(turn_epoch)
+                    and self._slot_inflight.get(chat_slot) is inf_obj
+                )
+
+            try:
+                if not already_persisted_user and not (raw_text.startswith("/") and not attachments):
+                    self._append_slot_history(chat_slot, user_entry)
+            except Exception:
+                if self._slot_inflight.get(chat_slot) is inflight_state:
+                    self._slot_inflight.pop(chat_slot, None)
+                raise
 
             turn_start_sec = time.time()
             partial_before_finish = ""
@@ -3189,38 +3284,44 @@ class WebPwaServer:
             extra_pc_images: list[Path] = []
             result: TurnResult | None = None
 
-            async def _on_delta(delta: str) -> None:
-                cur_mid = str(inflight_state.get("msg_id") or reply_id)
-                inflight_state["text"] = str(inflight_state.get("text") or "") + delta
-                inflight_state["status"] = ""
-                if self._active_slot == chat_slot:
+            async def _on_delta(delta: str, inf_obj: dict[str, Any] = inflight_state, cur_rid: str = reply_id) -> None:
+                if not _owns_turn(inf_obj):
+                    return
+                cur_mid = str(inf_obj.get("msg_id") or cur_rid)
+                inf_obj["text"] = str(inf_obj.get("text") or "") + delta
+                inf_obj["status"] = ""
+                if self._active_slot == chat_slot and _owns_turn(inf_obj):
                     await self._broadcast(
                         {"type": "stream_delta", "slot": chat_slot, "msg_id": cur_mid, "delta": delta}
                     )
 
-            async def _on_reset() -> None:
-                cur_mid = str(inflight_state.get("msg_id") or reply_id)
-                inflight_state["text"] = ""
-                if self._active_slot == chat_slot:
+            async def _on_reset(inf_obj: dict[str, Any] = inflight_state, cur_rid: str = reply_id) -> None:
+                if not _owns_turn(inf_obj):
+                    return
+                cur_mid = str(inf_obj.get("msg_id") or cur_rid)
+                inf_obj["text"] = ""
+                if self._active_slot == chat_slot and _owns_turn(inf_obj):
                     await self._broadcast({"type": "stream_reset", "slot": chat_slot, "msg_id": cur_mid})
 
-            async def _on_status(status_txt: str) -> None:
-                cur_mid = str(inflight_state.get("msg_id") or reply_id)
-                inflight_state["status"] = status_txt
+            async def _on_status(status_txt: str, inf_obj: dict[str, Any] = inflight_state, cur_rid: str = reply_id) -> None:
+                if not _owns_turn(inf_obj):
+                    return
+                cur_mid = str(inf_obj.get("msg_id") or cur_rid)
+                inf_obj["status"] = status_txt
                 clean_st = status_txt.strip().rstrip(".")
                 if clean_st and clean_st != "正在思考":
-                    steps_arr: list[str] = inflight_state.setdefault("steps", [])
+                    steps_arr: list[str] = inf_obj.setdefault("steps", [])
                     if not steps_arr or steps_arr[-1] != clean_st:
                         if len(steps_arr) < 16:
                             steps_arr.append(clean_st)
-                if self._active_slot == chat_slot:
+                if self._active_slot == chat_slot and _owns_turn(inf_obj):
                     await self._broadcast(
                         {
                             "type": "stream_status",
                             "slot": chat_slot,
                             "msg_id": cur_mid,
                             "status": status_txt,
-                            "steps": list(inflight_state.get("steps") or []),
+                            "steps": list(inf_obj.get("steps") or []),
                         }
                     )
 
@@ -3379,7 +3480,7 @@ class WebPwaServer:
 
                 # 3b. Plugin Ecosystem Multi-Agents (`dsh`, `workbuddy`, `copilot`, `doubao_api`, `deepseek_api`, `ollama`, `api:*`)
                 elif slot_store and slot_store not in {"ide", "codex", "cli"}:
-                    eff_epoch = conn_epoch if conn_epoch > 0 else self.auth.current_epoch()
+                    eff_epoch = turn_epoch
                     eco_out = await self._try_run_ecosystem_agent_turn(
                         chat_slot=chat_slot,
                         store=slot_store,
@@ -3466,10 +3567,19 @@ class WebPwaServer:
                     response=str(inflight_state.get("text") or ""),
                     active_model=initial_model_label,
                 )
+            except Exception as exc:
+                logger.exception("Unhandled error during chat turn execution (slot=%s): %s", chat_slot, exc)
+                result = TurnResult(
+                    status="ERROR",
+                    response=str(inflight_state.get("text") or ""),
+                    error=f"执行过程发生异常：{exc}",
+                    active_model=initial_model_label,
+                )
             finally:
                 partial_before_finish = str(inflight_state.get("text") or "")
                 if (
-                    not pc_direct_persisted
+                    self.auth.is_epoch_active(turn_epoch)
+                    and not pc_direct_persisted
                     and self._pc_window_sender is None
                     and session.linked_ide_id
                     and session.conversation_id
@@ -3477,138 +3587,182 @@ class WebPwaServer:
                     map_key = f"{session.linked_store}:{session.linked_ide_id}" if session.linked_store else session.linked_ide_id
                     self._continuation_map[map_key] = session.conversation_id
                     self._continuation_map[session.linked_ide_id] = session.conversation_id
-                    await asyncio.to_thread(self._save_continuation_map)
+                    try:
+                        await asyncio.to_thread(self._save_continuation_map)
+                    except Exception as map_exc:
+                        logger.warning("Failed saving continuation map: %s", map_exc)
 
-            final_reply_id = str(inflight_state.get("msg_id") or reply_id)
-            was_user_cancelled = final_reply_id in self._cancelled_reply_ids or reply_id in self._cancelled_reply_ids
-            self._cancelled_reply_ids.discard(final_reply_id)
-            self._cancelled_reply_ids.discard(reply_id)
+            handed_off_next = False
+            try:
+                final_reply_id = str(inflight_state.get("msg_id") or reply_id)
+                was_user_cancelled = final_reply_id in self._cancelled_reply_ids or reply_id in self._cancelled_reply_ids
+                self._cancelled_reply_ids.discard(final_reply_id)
+                self._cancelled_reply_ids.discard(reply_id)
 
-            if result.status == "SUCCESS":
-                clean_text, img_paths, file_paths = extract_pwa_media_and_text(result.response or "")
-                if result.switched_from_model and result.active_model:
-                    note = f"（注：{result.switched_from_model} 额度已满，已自动切到 {result.active_model}）"
-                    clean_text = f"{clean_text}\n\n{note}" if clean_text else note
-            elif was_user_cancelled or result.status == "CANCELLED":
-                clean_resp, img_paths, file_paths = extract_pwa_media_and_text(result.response or partial_before_finish)
-                clean_text = f"{clean_resp}\n\n⏹ 已停止生成。".strip() if clean_resp else "⏹ 已停止生成。"
-            else:
-                clean_resp, img_paths, file_paths = extract_pwa_media_and_text(result.response or partial_before_finish)
-                err = result.error or f"执行未成功 ({result.status})"
-                clean_text = f"{clean_resp}\n\n刚才这步出了点状况：\n{err}".strip()
+                if not self.auth.is_epoch_active(turn_epoch):
+                    logger.info("Discarding stale post-revocation turn output for slot=%s (epoch=%d)", chat_slot, turn_epoch)
+                    break
 
-            for ep in extra_pc_images:
-                if ep not in img_paths and is_safe_outbound_file(ep, image_only=True):
-                    img_paths.append(ep)
+                if result.status == "SUCCESS":
+                    clean_text, img_paths, file_paths = extract_pwa_media_and_text(result.response or "")
+                    if result.switched_from_model and result.active_model:
+                        note = f"（注：{result.switched_from_model} 额度已满，已自动切到 {result.active_model}）"
+                        clean_text = f"{clean_text}\n\n{note}" if clean_text else note
+                elif was_user_cancelled or result.status == "CANCELLED":
+                    clean_resp, img_paths, file_paths = extract_pwa_media_and_text(result.response or partial_before_finish)
+                    clean_text = f"{clean_resp}\n\n⏹ 已停止生成。".strip() if clean_resp else "⏹ 已停止生成。"
+                else:
+                    clean_resp, img_paths, file_paths = extract_pwa_media_and_text(result.response or partial_before_finish)
+                    err = result.error or f"执行未成功 ({result.status})"
+                    clean_text = f"{clean_resp}\n\n刚才这步出了点状况：\n{err}".strip()
 
-            if pc_direct_persisted:
-                # Turn was written directly into the PC IDE / Codex / WorkBuddy / API transcript — avoid duplicating in `_slot_local_turns`!
-                self._remove_slot_local_turn(chat_slot, client_id)
-            elif slot_store in {"", "cli"}:
-                cli_root = self.cli_store_dir if self.cli_store_dir is not None else _default_cli_dir()
-                harvested = await asyncio.to_thread(
-                    harvest_recent_cli_turn_images,
-                    cli_root,
-                    result.conversation_id or session.conversation_id,
-                    turn_start_sec,
-                )
-                for hp in harvested:
-                    if hp not in img_paths:
-                        img_paths.append(hp)
+                for ep in extra_pc_images:
+                    if ep not in img_paths and is_safe_outbound_file(ep, image_only=True):
+                        img_paths.append(ep)
 
-            if result.status == "SUCCESS" and not clean_text and not img_paths and not file_paths:
-                clean_text = "已完成。"
+                if pc_direct_persisted:
+                    # Turn was written directly into the PC IDE / Codex / WorkBuddy / API transcript — avoid duplicating in `_slot_local_turns`!
+                    self._remove_slot_local_turn(chat_slot, client_id)
+                elif slot_store in {"", "cli"}:
+                    cli_root = self.cli_store_dir if self.cli_store_dir is not None else _default_cli_dir()
+                    harvested = await asyncio.to_thread(
+                        harvest_recent_cli_turn_images,
+                        cli_root,
+                        result.conversation_id or session.conversation_id,
+                        turn_start_sec,
+                    )
+                    for hp in harvested:
+                        if hp not in img_paths:
+                            img_paths.append(hp)
 
-            # Update slot metadata if this was a brand-new conversation that just received a CLI ID
-            if chat_slot.startswith("new:") or chat_slot == DEFAULT_SLOT_KEY:
-                if session.conversation_id:
-                    meta_cur = self._slot_meta.setdefault(chat_slot, {})
-                    if not meta_cur.get("conversation_id"):
-                        meta_cur["conversation_id"] = session.conversation_id
-                        meta_cur["store"] = "cli"
-                        meta_cur["title"] = raw_text[:36] or "新对话"
+                if result.status == "SUCCESS" and not clean_text and not img_paths and not file_paths:
+                    clean_text = "已完成。"
 
-            img_items = [self._media_ref(p, name=p.name) for p in img_paths]
-            file_items = [
-                self._media_ref(p, name=p.name, size=self._safe_file_size(p))
-                for p in file_paths
-            ]
+                # Update slot metadata if this was a brand-new conversation that just received a CLI ID
+                if chat_slot.startswith("new:") or chat_slot == DEFAULT_SLOT_KEY:
+                    if session.conversation_id:
+                        meta_cur = self._slot_meta.setdefault(chat_slot, {})
+                        if not meta_cur.get("conversation_id"):
+                            meta_cur["conversation_id"] = session.conversation_id
+                            meta_cur["store"] = "cli"
+                            meta_cur["title"] = raw_text[:36] or "新对话"
 
-            assistant_entry = {
-                "role": "assistant",
-                "id": final_reply_id,
-                "text": clean_text,
-                "images": img_items,
-                "files": file_items,
-                "steps": list(inflight_state.get("steps") or []),
-                "duration_sec": max(1, int(round(time.time() - turn_start_sec))),
-                "model": result.active_model or session.model or "default",
-                "ts": int(time.time() * 1000),
-            }
-            self._append_slot_history(chat_slot, assistant_entry, persist_local=not pc_direct_persisted)
-            if not pc_direct_persisted and slot_store in {"dsh", "copilot"}:
-                meta_sync = self._slot_meta.get(chat_slot, {})
-                canon_cid = str(result.conversation_id or meta_sync.get("conversation_id") or "")
-                canon_slot = f"{slot_store}:{canon_cid}" if canon_cid else ""
-                if canon_slot and canon_slot != chat_slot:
-                    loc_canon = self._slot_local_turns.setdefault(canon_slot, [])
-                    _extend_deduplicated_turns(loc_canon, list(self._slot_local_turns.get(chat_slot) or []))
-                    self._slot_local_turns[canon_slot] = loc_canon[-100:]
+                img_items = [self._media_ref(p, name=p.name) for p in img_paths]
+                file_items = [
+                    self._media_ref(p, name=p.name, size=self._safe_file_size(p))
+                    for p in file_paths
+                ]
 
-            # Atomically check FIFO follow-up queue BEFORE releasing `self._slot_inflight[chat_slot]`!
-            fq_after = self._slot_followup_queue.get(chat_slot)
-            has_next_queued = bool(fq_after)
-            if not has_next_queued and self._slot_inflight.get(chat_slot) is inflight_state:
-                self._slot_inflight.pop(chat_slot, None)
-                if was_brand_new and self._clients:
-                    for cli_ws in list(self._clients):
+                if not self.auth.is_epoch_active(turn_epoch):
+                    break
+
+                assistant_entry = {
+                    "role": "assistant",
+                    "id": final_reply_id,
+                    "text": clean_text,
+                    "images": img_items,
+                    "files": file_items,
+                    "steps": list(inflight_state.get("steps") or []),
+                    "duration_sec": max(1, int(round(time.time() - turn_start_sec))),
+                    "model": result.active_model or session.model or "default",
+                    "ts": int(time.time() * 1000),
+                }
+                self._append_slot_history(chat_slot, assistant_entry, persist_local=not pc_direct_persisted)
+                if not pc_direct_persisted and slot_store in {"dsh", "copilot"}:
+                    meta_sync = self._slot_meta.get(chat_slot, {})
+                    canon_cid = str(result.conversation_id or meta_sync.get("conversation_id") or "")
+                    canon_slot = f"{slot_store}:{canon_cid}" if canon_cid else ""
+                    if canon_slot and canon_slot != chat_slot:
+                        loc_canon = self._slot_local_turns.setdefault(canon_slot, [])
+                        _extend_deduplicated_turns(loc_canon, list(self._slot_local_turns.get(chat_slot) or []))
+                        self._slot_local_turns[canon_slot] = loc_canon[-100:]
+
+                # Atomically check FIFO follow-up queue BEFORE releasing `self._slot_inflight[chat_slot]`!
+                fq_after = self._slot_followup_queue.get(chat_slot)
+                has_next_queued = bool(fq_after) and self.auth.is_epoch_active(turn_epoch)
+                if not has_next_queued and self._slot_inflight.get(chat_slot) is inflight_state:
+                    self._slot_inflight.pop(chat_slot, None)
+                    if was_brand_new and self._clients:
+                        was_brand_new = False
                         try:
-                            await self._handle_list_conversations(cli_ws)
+                            await self._broadcast_conversations_list()
                         except Exception:
                             pass
 
-            if self._active_slot == chat_slot:
-                await self._broadcast(
-                    {
-                        "type": "stream_end",
-                        "slot": chat_slot,
-                        "item": assistant_entry,
-                        "keep_busy": has_next_queued,
-                        "slots_overview": self._build_slots_overview(),
-                    }
-                )
-            else:
-                meta_done = self._slot_meta.get(chat_slot, {})
-                done_title = meta_done.get("title") or "后台会话"
-                self._unread_slots[chat_slot] = {
-                    "slot": chat_slot,
-                    "conversation_id": str(meta_done.get("conversation_id") or result.conversation_id or ""),
-                    "store": str(meta_done.get("store") or "cli"),
-                    "title": done_title,
-                    "preview": clean_text[:60],
-                    "ts": int(time.time() * 1000),
-                }
-                await self._broadcast_slots_overview()
-                await self._broadcast(
-                    {
-                        "type": "toast",
-                        "level": "info",
-                        "text": f"✓ 「{done_title[:18]}」已完成回复",
-                    }
-                )
+                if not self.auth.is_epoch_active(turn_epoch):
+                    break
 
-            if has_next_queued and fq_after:
-                nxt = fq_after.pop(0)
-                raw_text = str(nxt["raw_text"])
-                attachments = nxt["attachments"]
-                prompt_text = str(nxt["prompt_text"])
-                user_entry = nxt["user_entry"]
-                client_id = str(nxt["client_id"])
-                already_persisted_user = True
-                already_delivered_pc = False
-                preset_baseline = None
-                continue
-            break
+                if self._active_slot == chat_slot:
+                    await self._broadcast(
+                        {
+                            "type": "stream_end",
+                            "slot": chat_slot,
+                            "item": assistant_entry,
+                            "keep_busy": has_next_queued,
+                            "slots_overview": self._build_slots_overview(),
+                        }
+                    )
+                else:
+                    meta_done = self._slot_meta.get(chat_slot, {})
+                    done_title = meta_done.get("title") or "后台会话"
+                    self._unread_slots[chat_slot] = {
+                        "slot": chat_slot,
+                        "conversation_id": str(meta_done.get("conversation_id") or result.conversation_id or ""),
+                        "store": str(meta_done.get("store") or "cli"),
+                        "title": done_title,
+                        "preview": clean_text[:60],
+                        "ts": int(time.time() * 1000),
+                    }
+                    await self._broadcast_slots_overview()
+                    await self._broadcast(
+                        {
+                            "type": "toast",
+                            "level": "info",
+                            "text": f"✓ 「{done_title[:18]}」已完成回复",
+                        }
+                    )
+
+                if has_next_queued and fq_after:
+                    nxt = fq_after.pop(0)
+                    raw_text = str(nxt["raw_text"])
+                    attachments = nxt["attachments"]
+                    prompt_text = str(nxt["prompt_text"])
+                    user_entry = nxt["user_entry"]
+                    client_id = str(nxt["client_id"])
+                    already_persisted_user = True
+                    already_delivered_pc = False
+                    preset_baseline = None
+                    was_brand_new = False
+                    handed_off_next = True
+                    continue
+                break
+            except Exception as post_exc:
+                logger.exception("Unhandled post-turn error (slot=%s): %s", chat_slot, post_exc)
+                if self._slot_inflight.get(chat_slot) is inflight_state:
+                    self._slot_inflight.pop(chat_slot, None)
+                if self.auth.is_epoch_active(turn_epoch) and self._active_slot == chat_slot:
+                    err_entry = {
+                        "role": "assistant",
+                        "id": f"e-{uuid.uuid4().hex[:8]}",
+                        "text": f"消息后处理出错：{post_exc}",
+                        "images": [],
+                        "files": [],
+                        "model": initial_model_label,
+                        "ts": int(time.time() * 1000),
+                    }
+                    await self._broadcast(
+                        {
+                            "type": "stream_end",
+                            "slot": chat_slot,
+                            "item": err_entry,
+                            "keep_busy": False,
+                            "slots_overview": self._build_slots_overview(),
+                        }
+                    )
+                break
+            finally:
+                if not handed_off_next and self._slot_inflight.get(chat_slot) is inflight_state:
+                    self._slot_inflight.pop(chat_slot, None)
 
     async def _send_sys_reply(
         self, slot_key: str, text: str, model: str = "", images: list[dict] | None = None
@@ -3632,7 +3786,10 @@ class WebPwaServer:
         arg = parts[1].strip() if len(parts) > 1 else ""
 
         if cmd in {"/screen", "/shot"}:
-            shot = await asyncio.to_thread(capture_desktop_fast_jpeg_sync, PROJECT_INBOX_DIR)
+            if not self._build_capabilities()["remote_desktop"]["enabled"]:
+                await self._send_sys_reply(slot_key, "当前主机未启用远程桌面截屏权限。", session.model)
+                return True
+            shot = await asyncio.to_thread(self._screen_capturer, PROJECT_INBOX_DIR, 1440, 80)
             await self._send_sys_reply(
                 slot_key,
                 "当前电脑桌面截图：",
@@ -3649,21 +3806,27 @@ class WebPwaServer:
             new_slot = f"new:{uuid.uuid4().hex[:8]}"
             new_sess = self._session_for_slot(new_slot)
             await new_sess.start_new_conversation(workspace=str(session.workspace))
+            if prev_store not in {"", "ide", "cli"}:
+                await new_sess.attach_ide_conversation(
+                    "",
+                    handoff_context="",
+                    workspace=str(session.workspace),
+                    title="Stayy",
+                    store=prev_store,
+                )
             self._active_slot = new_slot
             self._slot_history[new_slot] = []
             self._slot_meta[new_slot] = {"conversation_id": "", "title": "Stayy", "store": prev_store}
             self._ide_watch_sig = ("", "", 0, 0)
-            await self._broadcast({"type": "clear_history", "nav_seq": self._nav_seq, "slot": new_slot})
+            await self._broadcast(
+                {"type": "clear_history", "nav_seq": self._nav_seq, "slot": new_slot, "target_store": prev_store}
+            )
             await self._broadcast_slots_overview()
             await self._broadcast(
                 {
                     "type": "meta_update",
                     "slot": new_slot,
-                    "model": (
-                        "Antigravity 电脑端"
-                        if prev_store == "ide"
-                        else ("Codex 电脑端" if prev_store == "codex" else (new_sess.model or "default"))
-                    ),
+                    "model": self._display_model_for_store(prev_store, new_sess.model or "default"),
                     "workspace": str(new_sess.workspace),
                     "active_conversation_id": "",
                     "active_title": "Stayy",
@@ -3746,18 +3909,22 @@ class WebPwaServer:
         if not watch_store:
             watch_store = str(session.linked_store or "ide")
 
-        # Low-power optional Bark check ONLY when configured AND (active task running or viewing live IDE window)
-        if self.bark_notifier.enabled and (cur_slot in self._slot_inflight or (watch_store == "ide" and ide_cid)):
-            try:
-                ro_actions = await asyncio.to_thread(self._ide_actions_inspector, ide_cid)
-                event_keys = [
-                    str(a.get("event_key") or "")
-                    for a in (ro_actions or [])
-                    if isinstance(a, dict) and a.get("event_key")
-                ]
-                await asyncio.to_thread(self.bark_notifier.notify_for_events, event_keys)
-            except Exception as exc:
-                logger.debug("Optional Bark watcher skipped: %s", exc)
+        # Low-power optional Bark check ONLY when configured AND (active task running or throttled >=6s idle IDE watch)
+        is_inflight_cur = cur_slot in self._slot_inflight
+        now_bark_mono = time.monotonic()
+        if self.bark_notifier.enabled and (is_inflight_cur or (watch_store == "ide" and ide_cid)):
+            if is_inflight_cur or self._last_bark_scan_mono == 0.0 or (now_bark_mono - self._last_bark_scan_mono) >= 6.0:
+                self._last_bark_scan_mono = now_bark_mono
+                try:
+                    ro_actions = await asyncio.to_thread(self._ide_actions_inspector, ide_cid)
+                    event_keys = [
+                        str(a.get("event_key") or "")
+                        for a in (ro_actions or [])
+                        if isinstance(a, dict) and a.get("event_key")
+                    ]
+                    await asyncio.to_thread(self.bark_notifier.notify_for_events, event_keys)
+                except Exception as exc:
+                    logger.debug("Optional Bark watcher skipped: %s", exc)
 
         async with self._clients_lock:
             has_clients = bool(self._clients)
@@ -3923,8 +4090,23 @@ class WebPwaServer:
                     k, v = dec.split(":", 1)
                     hdrs[k.strip().lower()] = v.strip()
 
-            clen = int(hdrs.get("content-length") or "0")
-            if 0 < clen <= 65536:
+            try:
+                clen = int(hdrs.get("content-length") or "0")
+            except ValueError:
+                clen = -1
+            if clen < 0 or clen > 65536:
+                body = json.dumps({"ok": False, "error": "invalid_content_length"}).encode("utf-8")
+                hdr = (
+                    f"HTTP/1.1 400 Bad Request\r\n"
+                    "Content-Type: application/json; charset=utf-8\r\n"
+                    f"Content-Length: {len(body)}\r\n"
+                    "Cache-Control: no-store\r\n"
+                    "Connection: close\r\n\r\n"
+                ).encode("ascii")
+                writer.write(hdr + body)
+                await writer.drain()
+                return
+            if clen > 0:
                 await asyncio.wait_for(reader.readexactly(clen), timeout=4.0)
 
             provided = hdrs.get("x-admin-token", "")
@@ -3999,7 +4181,7 @@ class WebPwaServer:
 
         admin_srv = await asyncio.start_server(self._handle_admin_http, "127.0.0.1", 0)
         sock_addr = admin_srv.sockets[0].getsockname()
-        self.admin_port = int(sock_addr[1])
+        bound_admin_port = int(sock_addr[1])
 
         serve_kwargs: dict[str, Any] = {
             "process_request": self._process_request,
@@ -4019,9 +4201,10 @@ class WebPwaServer:
                 **serve_kwargs,
             ):
                 self._admin_state_file = await asyncio.to_thread(
-                    write_admin_state, self.runtime_dir, self.admin_port, self.admin_secret, os.getpid()
+                    write_admin_state, self.runtime_dir, bound_admin_port, self.admin_secret, os.getpid()
                 )
-                logger.info("Stayy loopback admin control plane listening on 127.0.0.1:%d", self.admin_port)
+                self.admin_port = bound_admin_port
+                logger.info("Stayy loopback admin control plane listening on 127.0.0.1:%d", bound_admin_port)
                 if stop_event is not None:
                     await stop_event.wait()
                 else:

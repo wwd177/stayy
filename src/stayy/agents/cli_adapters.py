@@ -220,6 +220,8 @@ async def run_cli_agent_turn(
         )
         stdin_payload = prompt.encode("utf-8")
     elif store == "copilot":
+        if len(prompt or "") > 24000:
+            return AgentRunResult(ok=False, error="Copilot CLI 单次指令超过 24000 字命令行安全上限，请精简后再试")
         cmd, base_env = build_copilot_command(
             install_info, prompt=prompt, session_id=session_id, model=model, allow_write=allow_write
         )
@@ -241,16 +243,19 @@ async def run_cli_agent_turn(
     if sys.platform == "win32":
         extra_kwargs["creationflags"] = CREATE_NO_WINDOW
 
-    proc = await asyncio.create_subprocess_exec(
-        *cmd,
-        stdin=asyncio.subprocess.PIPE if stdin_payload is not None else asyncio.subprocess.DEVNULL,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        cwd=str(cwd),
-        env=env,
-        limit=STREAM_LIMIT,
-        **extra_kwargs,
-    )
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdin=asyncio.subprocess.PIPE if stdin_payload is not None else asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=str(cwd),
+            env=env,
+            limit=STREAM_LIMIT,
+            **extra_kwargs,
+        )
+    except OSError as exc:
+        return AgentRunResult(ok=False, error=f"启动 {store} 失败：{exc}")
     if cb.on_proc_started:
         await cb.on_proc_started(proc)
 
@@ -272,7 +277,10 @@ async def run_cli_agent_turn(
     async def _drain_stderr() -> None:
         assert proc.stderr is not None
         while True:
-            raw = await proc.stderr.readline()
+            try:
+                raw = await proc.stderr.readline()
+            except ValueError:
+                break
             if not raw:
                 break
             s = raw.decode("utf-8", errors="replace").rstrip()
@@ -293,7 +301,13 @@ async def run_cli_agent_turn(
         assert proc.stdout is not None
         wb_snapshot = ""
         while True:
-            raw = await proc.stdout.readline()
+            try:
+                raw = await proc.stdout.readline()
+            except ValueError:
+                fatal_err = f"{store} 单行输出超过 4MB 安全上限，已终止"
+                if proc.returncode is None and proc.pid:
+                    await asyncio.to_thread(kill_pid_tree_sync, proc.pid)
+                break
             if not raw:
                 break
             line = raw.decode("utf-8", errors="replace").strip()
@@ -418,12 +432,6 @@ async def run_cli_agent_turn(
             if cb.on_delta:
                 await cb.on_delta(wb_snapshot)
 
-        if plain_lines and not collected_text and not fatal_err:
-            joined = "\n".join(plain_lines)
-            collected_text.append(joined)
-            if cb.on_delta:
-                await cb.on_delta(joined)
-
     stderr_task = asyncio.create_task(_drain_stderr())
     cancel_task = asyncio.create_task(_watch_cancel()) if cancel_event is not None else None
     rc: int | None = None
@@ -469,12 +477,22 @@ async def run_cli_agent_turn(
     if timed_out:
         return AgentRunResult(ok=False, session_id=final_sid, error=f"{store} 执行超过 {int(timeout_sec)}s 已安全终止")
 
+    if plain_lines and not collected_text and not fatal_err and rc == 0:
+        joined = "\n".join(plain_lines)
+        collected_text.append(joined)
+        if cb.on_delta:
+            await cb.on_delta(joined)
+
     text_out = "".join(collected_text).strip()
     thought_out = "".join(collected_thought).strip()
     if fatal_err and not text_out:
         return AgentRunResult(ok=False, session_id=final_sid, error=fatal_err)
     if rc not in (0, None) and not text_out:
-        err_detail = "\n".join(stderr_lines).strip() or f"{store} CLI 退出码: {rc}"
+        err_detail = (
+            "\n".join(stderr_lines).strip()
+            or "\n".join(plain_lines[-8:]).strip()
+            or f"{store} CLI 退出码: {rc}"
+        )
         return AgentRunResult(ok=False, session_id=final_sid, error=err_detail)
 
     return AgentRunResult(

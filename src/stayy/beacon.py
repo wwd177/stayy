@@ -227,7 +227,7 @@ def load_beacon_state(runtime_dir: Path) -> dict[str, Any]:
 STATIC_PWA_SW_JS = """\
 const SCOPE_SLUG = new URL(self.registration.scope).pathname.replace(/[^a-zA-Z0-9_-]/g, '_');
 const CACHE_PREFIX = 'stayy-ios-shell-' + SCOPE_SLUG + '-';
-const CACHE_NAME = CACHE_PREFIX + 'v2';
+const CACHE_NAME = CACHE_PREFIX + 'v3';
 const REQUIRED_SHELL = ['./', './index.html'];
 const OPTIONAL_ASSETS = ['./apple-touch-icon.png', './icon-192.png', './icon-512.png', './manifest.json'];
 
@@ -277,7 +277,7 @@ self.addEventListener('fetch', (e) => {
 
   if (isNavShell) {
     e.respondWith(
-      fetchWithTimeout(e.request, 1800)
+      fetchWithTimeout(e.request, 3200)
         .then((res) => {
           if (!res || !res.ok) throw new Error('HTTP_' + (res ? res.status : 0));
           const clone = res.clone();
@@ -346,18 +346,20 @@ def build_static_pwa_bundle(
 
     # Never put credentials into manifest start_url
     manifest = {
+        "id": "./",
         "name": "Stayy",
         "short_name": "Stayy",
         "description": "Local-first AI Coding & Precision PC Remote Hub",
         "start_url": "./",
+        "scope": "./",
         "display": "standalone",
         "background_color": "#000000",
         "theme_color": "#000000",
         "orientation": "portrait-primary",
         "icons": [
-            {"src": "./apple-touch-icon.png", "sizes": "180x180", "type": "image/png"},
-            {"src": "./icon-192.png", "sizes": "192x192", "type": "image/png"},
-            {"src": "./icon-512.png", "sizes": "512x512", "type": "image/png"},
+            {"src": "./apple-touch-icon.png", "sizes": "180x180", "type": "image/png", "purpose": "any maskable"},
+            {"src": "./icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any maskable"},
+            {"src": "./icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any maskable"},
         ],
     }
     (stage_dir / "manifest.json").write_text(
@@ -397,6 +399,7 @@ def verify_published_beacon(
     expected_nonce: str,
     *,
     timeout: float = 10.0,
+    ignore_nonce: bool = False,
 ) -> tuple[bool, str, str]:
     """Read back deployed `beacon.json` over HTTP(S) to verify live publish & host identity.
 
@@ -421,14 +424,18 @@ def verify_published_beacon(
         return False, "pages_not_ready", f"无法读回在线信标：{exc}"
 
     try:
-        parsed = decrypt_beacon_payload(env_data, access_token, max_age_sec=600)
+        parsed = decrypt_beacon_payload(
+            env_data,
+            access_token,
+            max_age_sec=(None if ignore_nonce else 600),
+        )
     except Exception as exc:
         # Either CDN still serves an older key version or another host pushed with a different secret
         return False, "decrypt_failed", f"目标信标无法使用当前密钥解密（可能为旧密钥缓存或另一主机）：{exc}"
 
     if parsed.get("host_id") != expected_host_id:
         return False, "host_conflict", "目标分支当前绑定着另一台主机的 host_id，已拒绝复用"
-    if parsed.get("nonce") != expected_nonce:
+    if not ignore_nonce and parsed.get("nonce") != expected_nonce:
         return False, "pages_not_ready", "GitHub Pages CDN 仍在返回旧版信标，等待生效中"
     return True, "verified", "已核验 GitHub Pages 在线信标归属本机"
 

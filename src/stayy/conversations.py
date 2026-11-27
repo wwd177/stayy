@@ -211,7 +211,9 @@ def _extract_wb_text(content: Any) -> str:
 def _decode_wb_project_dirname(dirname: str) -> str:
     # WorkBuddy encodes `c:\Users\foo\bar` as `c-Users-foo-bar`; prefer inner cwd from JSONL lines when available
     if len(dirname) >= 3 and dirname[1] == "-":
-        return dirname[0].upper() + ":\\" + dirname[2:].replace("-", "\\")
+        cand = dirname[0].upper() + ":\\" + dirname[2:].replace("-", "\\")
+        if Path(cand).is_dir():
+            return cand
     return ""
 
 
@@ -1122,11 +1124,13 @@ def _resolve_codex_rollout(codex_root: Path, cid: str) -> tuple[Path | None, str
     if state_db is not None:
         try:
             con = sqlite3.connect(f"file:{state_db}?mode=ro", uri=True, timeout=2.0)
-            row = con.execute(
-                "SELECT rollout_path, title, cwd FROM threads WHERE id = ?",
-                (cid,),
-            ).fetchone()
-            con.close()
+            try:
+                row = con.execute(
+                    "SELECT rollout_path, title, cwd FROM threads WHERE id = ?",
+                    (cid,),
+                ).fetchone()
+            finally:
+                con.close()
             if row:
                 rp = Path(_clean_win_path(str(row[0] or "")))
                 t = index_titles.get(cid) or _summarize_codex_title(str(row[1] or ""))
@@ -1414,6 +1418,16 @@ def load_conversation_detail(
         codex_det = _load_codex_detail(cid, codex_root, max_messages)
         if codex_det is not None:
             return codex_det
+        dsh_det = _load_dsh_detail(cid, dsh_root, max_messages)
+        if dsh_det is not None:
+            return dsh_det
+        wb_det = _load_workbuddy_detail(cid, wb_root, max_messages)
+        if wb_det is not None:
+            return wb_det
+        if api_root.is_dir():
+            api_det = _load_api_session_detail(cid, "", api_root, max_messages)
+            if api_det is not None:
+                return api_det
 
     if chosen_base is None:
         for sk, base in candidates:
@@ -1421,11 +1435,13 @@ def load_conversation_detail(
             if db.is_file():
                 try:
                     con = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=2.0)
-                    row = con.execute(
-                        "SELECT title, workspace_uris, status FROM conversation_summaries WHERE conversation_id = ?",
-                        (cid,),
-                    ).fetchone()
-                    con.close()
+                    try:
+                        row = con.execute(
+                            "SELECT title, workspace_uris, status FROM conversation_summaries WHERE conversation_id = ?",
+                            (cid,),
+                        ).fetchone()
+                    finally:
+                        con.close()
                     if row:
                         return ConversationDetail(
                             conversation_id=cid,
@@ -1448,11 +1464,13 @@ def load_conversation_detail(
     if db_path.is_file():
         try:
             con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=2.0)
-            row = con.execute(
-                "SELECT title, workspace_uris, status FROM conversation_summaries WHERE conversation_id = ?",
-                (cid,),
-            ).fetchone()
-            con.close()
+            try:
+                row = con.execute(
+                    "SELECT title, workspace_uris, status FROM conversation_summaries WHERE conversation_id = ?",
+                    (cid,),
+                ).fetchone()
+            finally:
+                con.close()
             if row:
                 title = _clean_display_title(str(row[0] or ""), 60)
                 workspace = _parse_workspace_uris(str(row[1] or ""))

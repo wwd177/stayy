@@ -6,6 +6,7 @@ import os
 import shutil
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 from ..config import BridgeConfig
 from ..desktop_tools import find_codex_cli_executable
@@ -17,7 +18,7 @@ from .cli_adapters import (
 )
 from .desktop_apps import discover_desktop_ai_apps, launch_desktop_ai_app
 from .local_config import load_local_agent_overrides
-from .openai_compat import validate_llm_endpoint_url
+from .openai_compat import _is_loopback_host, validate_llm_endpoint_url
 
 
 class AgentRegistry:
@@ -223,13 +224,18 @@ class AgentRegistry:
             burl = ap["base_url"]
             key = ap["api_key"]
             mod = ap["model"]
-            is_local = aid == "ollama" or burl.startswith("http://127.0.0.1") or burl.startswith("http://localhost")
+            try:
+                parsed_host = urlparse(burl).hostname or "" if burl else ""
+            except Exception:
+                parsed_host = ""
+            is_local = (aid == "ollama") or _is_loopback_host(parsed_host)
+            should_validate = bool(burl and mod and (is_local or key))
             ok_url, _, _, _ = (
                 validate_llm_endpoint_url(burl, allow_local_ports=self.config.stayy_allow_local_llm_ports)
-                if burl
+                if should_validate
                 else (False, "", [], False)
             )
-            cfg_ready = bool(ok_url and mod and (is_local or key))
+            cfg_ready = bool(should_validate and ok_url)
             specs[aid] = AgentSpec(
                 id=aid,
                 name=ap["name"],

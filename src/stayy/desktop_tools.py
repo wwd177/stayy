@@ -20,6 +20,7 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 _DESKTOP_UIA_LOCK = threading.Lock()
+_GDIP_LOCK = threading.Lock()
 _IDE_ACTION_LOCK = threading.Lock()
 _IDE_ACTION_TOKENS: dict[str, dict[str, Any]] = {}
 
@@ -40,13 +41,29 @@ SENSITIVE_FILENAMES = {
     ".env",
     ".env.local",
     ".env.production",
+    "agents.local.json",
+    "admin.json",
+    "beacon_state.json",
     "id_rsa",
     "id_ed25519",
+    "id_ecdsa",
+    "id_dsa",
     "auth.json",
     "passkey.json",
     "cookies.sqlite",
     "credentials.json",
 }
+SENSITIVE_KEY_SUFFIXES = {".pem", ".key", ".p12", ".pfx"}
+
+
+def is_sensitive_path(path_or_rel: Path | str) -> bool:
+    """Return True when filename or suffix matches credentials, private keys, or Stayy runtime secrets."""
+    name_low = Path(str(path_or_rel)).name.strip().lower()
+    if not name_low:
+        return False
+    if name_low in SENSITIVE_FILENAMES or name_low.startswith(".env"):
+        return True
+    return Path(name_low).suffix in SENSITIVE_KEY_SUFFIXES
 
 HIDDEN_DIR_SKIP = {
     ".git",
@@ -86,7 +103,7 @@ def is_safe_outbound_file(path: Path, *, image_only: bool = False) -> bool:
         if not resolved.is_file():
             return False
         name_low = resolved.name.lower()
-        if name_low in SENSITIVE_FILENAMES or name_low.startswith(".env."):
+        if is_sensitive_path(resolved):
             logger.warning("Blocked sending sensitive file: %s", resolved)
             return False
         size = resolved.stat().st_size
@@ -165,6 +182,14 @@ def get_desktop_cursor_ratio() -> dict[str, float | int]:
 
 
 def _capture_desktop_gdiplus_fast(dest: Path, max_width: int, quality: int) -> bool:
+    """Serialize Win32 GDI/GDI+ desktop capture across threads."""
+    if sys.platform != "win32":
+        return False
+    with _GDIP_LOCK:
+        return _capture_desktop_gdiplus_fast_locked(dest, max_width, quality)
+
+
+def _capture_desktop_gdiplus_fast_locked(dest: Path, max_width: int, quality: int) -> bool:
     """Fast ~35ms pure-ctypes Win32 GDI + GDI+ JPEG screen capture with hardware cursor stamped at exact hotspot."""
     if sys.platform != "win32":
         return False
@@ -547,10 +572,16 @@ def inspect_workspace_git(workspace: Path) -> dict[str, Any]:
             code = raw[:2].strip() or "M"
             rel = raw[3:].strip()
             if " -> " in rel:
-                rel = rel.split(" -> ", 1)[1].strip()
-            rel = rel.strip('"')
-            if Path(rel).name.lower() in SENSITIVE_FILENAMES:
-                continue
+                old_rel, new_rel = rel.split(" -> ", 1)
+                old_rel = old_rel.strip().strip('"')
+                new_rel = new_rel.strip().strip('"')
+                if is_sensitive_path(old_rel) or is_sensitive_path(new_rel):
+                    continue
+                rel = new_rel
+            else:
+                rel = rel.strip('"')
+                if is_sensitive_path(rel):
+                    continue
             changes.append({"status": code, "path": rel})
             if len(changes) >= 120:
                 break
@@ -562,13 +593,36 @@ def inspect_workspace_git(workspace: Path) -> dict[str, Any]:
 def get_workspace_file_diff(workspace: Path, rel_path: str, max_chars: int = 24000) -> dict[str, Any]:
     """Return unified git diff (or new-file preview for untracked files) inside `workspace`."""
     target = _resolve_inside_workspace(workspace, rel_path)
-    if target is None or target.name.lower() in SENSITIVE_FILENAMES:
+    if target is None or is_sensitive_path(target):
         return {"ok": False, "path": rel_path, "diff": "无法读取该路径或敏感配置文件已受保护。"}
 
     ws = workspace.resolve()
     rel_clean = str(target.relative_to(ws)).replace("\\", "/")
     extra = {"creationflags": CREATE_NO_WINDOW} if sys.platform == "win32" else {}
     try:
+        st_chk = subprocess.run(
+            ["git", "-c", "core.quotepath=false", "status", "--porcelain=v1"],
+            cwd=str(ws),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=4,
+            **extra,
+        )
+        for st_line in (st_chk.stdout or "").splitlines():
+            if len(st_line) < 4:
+                continue
+            rel_st = st_line[3:].strip()
+            if " -> " in rel_st:
+                old_st, new_st = rel_st.split(" -> ", 1)
+                old_clean = old_st.strip().strip('"')
+                new_clean = new_st.strip().strip('"')
+                if (new_clean == rel_clean or old_clean == rel_clean) and (
+                    is_sensitive_path(old_clean) or is_sensitive_path(new_clean)
+                ):
+                    return {"ok": False, "path": rel_clean, "diff": "无法读取该路径或敏感配置文件已受保护。"}
+
         res = subprocess.run(
             ["git", "-c", "core.quotepath=false", "diff", "HEAD", "--", rel_clean],
             cwd=str(ws),
@@ -597,6 +651,18 @@ def get_workspace_file_diff(workspace: Path, rel_path: str, max_chars: int = 240
             raw_txt = target.read_text(encoding="utf-8", errors="replace")
             added = "\n".join(f"+{ln}" for ln in raw_txt.splitlines()[:300])
             diff_txt = f"--- /dev/null\n+++ b/{rel_clean}\n@@ 新文件预览 @@\n{added}"
+        for dline in diff_txt.splitlines():
+            ref_path = ""
+            if dline.startswith("--- a/"):
+                ref_path = dline[6:].strip()
+            elif dline.startswith("+++ b/"):
+                ref_path = dline[6:].strip()
+            elif dline.startswith("rename from "):
+                ref_path = dline[12:].strip()
+            elif dline.startswith("rename to "):
+                ref_path = dline[10:].strip()
+            if ref_path and is_sensitive_path(ref_path.strip('"')):
+                return {"ok": False, "path": rel_clean, "diff": "无法读取该路径或敏感配置文件已受保护。"}
         if len(diff_txt) > max_chars:
             diff_txt = diff_txt[:max_chars] + "\n\n... (Diff 较长，已截断显示前 24KB)"
         return {"ok": True, "path": rel_clean, "diff": diff_txt or "（无文本差异或二进制文件）"}
@@ -618,7 +684,7 @@ def list_workspace_directory(workspace: Path, rel_dir: str = "") -> dict[str, An
     try:
         for child in sorted(target.iterdir(), key=lambda p: p.name.lower()):
             name = child.name
-            if name.lower() in SENSITIVE_FILENAMES or name.lower().startswith(".env."):
+            if is_sensitive_path(child):
                 continue
             child_rel = str(child.relative_to(ws)).replace("\\", "/")
             if child.is_dir():
@@ -644,9 +710,15 @@ def list_workspace_directory(workspace: Path, rel_dir: str = "") -> dict[str, An
 
 def read_workspace_file_preview(workspace: Path, rel_path: str, max_chars: int = 24000) -> dict[str, Any]:
     """Read a safe UTF-8 text preview (or image metadata) of a file inside `workspace`."""
+    safe_max_chars = min(max(1024, int(max_chars)), 128000)
     target = _resolve_inside_workspace(workspace, rel_path)
     ws = workspace.resolve()
-    if target is None or not target.is_file() or not is_safe_outbound_file(target, image_only=False):
+    if (
+        target is None
+        or not target.is_file()
+        or is_sensitive_path(target)
+        or not is_safe_outbound_file(target, image_only=False)
+    ):
         return {"ok": False, "path": rel_path, "error": "文件不存在或属于受保护的隐私配置。"}
 
     rel_clean = str(target.relative_to(ws)).replace("\\", "/")
@@ -657,7 +729,8 @@ def read_workspace_file_preview(workspace: Path, rel_path: str, max_chars: int =
         return {"ok": True, "path": rel_clean, "name": target.name, "size": size, "is_image": True, "content": ""}
 
     try:
-        raw_bytes = target.read_bytes()[: max_chars * 3]
+        with target.open("rb") as fh:
+            raw_bytes = fh.read(safe_max_chars * 3)
         if b"\x00" in raw_bytes[:2048]:
             return {
                 "ok": True,
@@ -669,9 +742,9 @@ def read_workspace_file_preview(workspace: Path, rel_path: str, max_chars: int =
                 "content": "",
             }
         txt = raw_bytes.decode("utf-8", errors="replace")
-        truncated = len(txt) > max_chars or size > len(raw_bytes)
-        if len(txt) > max_chars:
-            txt = txt[:max_chars]
+        truncated = len(txt) > safe_max_chars or size > len(raw_bytes)
+        if len(txt) > safe_max_chars:
+            txt = txt[:safe_max_chars]
         return {
             "ok": True,
             "path": rel_clean,

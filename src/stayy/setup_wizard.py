@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import base64
 import json
+import logging
 import os
 import platform
 import secrets
@@ -30,6 +31,7 @@ from .desktop_tools import find_codex_cli_executable
 from .notifier import redact_url
 from .web_pwa import get_lan_ipv4
 
+logger = logging.getLogger(__name__)
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
 
@@ -98,8 +100,15 @@ def ensure_env_configured(
         lines = _update_env_key(lines, "WEB_PWA_PORT", str(pwa_port))
 
     tmp = env_path.with_name(f".{env_path.name}.{secrets.token_hex(4)}.tmp")
-    tmp.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    os.replace(tmp, env_path)
+    try:
+        tmp.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        os.replace(tmp, env_path)
+    except Exception:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
 
     mem_target = project_dir / "memory" / "user_profile.md"
     mem_example = project_dir / "memory" / "user_profile.example.md"
@@ -435,12 +444,16 @@ def run_doctor(
         "allow_agent_write": bool(parsed_cfg.stayy_allow_agent_write) if parsed_cfg else False,
     }
     try:
-        eco_cfg = parsed_cfg or BridgeConfig(web_access_token=raw_token or "doctor-placeholder-token")
+        eco_cfg = parsed_cfg or BridgeConfig(
+            agy_executable=resolve_agy_executable(agy_cfg),
+            agy_workspace=project_dir,
+            web_access_token=raw_token or "doctor-placeholder-token",
+        )
         reg = AgentRegistry(
             eco_cfg,
             project_dir=project_dir,
             ide_store_dir=ide_store_dir,
-            has_pc_ide_sender=bool(backends.get("ide", {}).get("available")),
+            has_pc_ide_sender=bool(backends.get("antigravity_ide", {}).get("available")),
         )
         cat = reg.public_catalog()
         eco_cli_api = [a for a in cat if a.get("kind") != "desktop_app" and a.get("configured")]

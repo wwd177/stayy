@@ -3685,6 +3685,8 @@
   let pingTimer = null;
   let lastRttMs = null;
   let optimisticWaitRowId = null;
+  let optimisticWaitClientId = '';
+  let pendingReattachCid = '';
   let activeSlot = '';
   let activeConvId = '';
   let activeConvStore = '';
@@ -5475,6 +5477,11 @@
         if (targetReattachCid) {
           // Server restarted onto empty `default-chat` while mobile was viewing a PC conversation:
           // wait for `conversation_loaded` ack BEFORE flushing `outboundQueue` so `select` and `chat` never race!
+          activeSlot = data.slot || activeSlot;
+          currentModelLabel = data.model || currentModelLabel;
+          subInfo.dataset.wsName = (data.workspace || '').split(/[\\/]/).pop() || subInfo.dataset.wsName || '';
+          if (data.slots_overview) applySlotsOverview(data.slots_overview);
+          pendingReattachCid = targetReattachCid;
           wsInstance.send(JSON.stringify({
             type: 'select_conversation',
             conversation_id: targetReattachCid,
@@ -5483,6 +5490,7 @@
           }));
           return;
         }
+        pendingReattachCid = '';
 
         activeSlot = data.slot || '';
         currentModelLabel = data.model || '';
@@ -5528,6 +5536,10 @@
       } else if (data.type === 'slots_overview') {
         applySlotsOverview(data);
       } else if (data.type === 'chat_ack') {
+        if (data.stage === 'duplicate_ignored' && data.client_id && data.client_id === optimisticWaitClientId) {
+          clearOptimisticPlaceholder();
+          if (!activeStreamMsgId) setStreamingState(false);
+        }
         const rcptEl = document.getElementById('rcpt-' + data.client_id);
         if (rcptEl && data.label) rcptEl.textContent = data.label;
       } else if (data.type === 'ide_actions') {
@@ -5564,6 +5576,7 @@
         renderMoreBentoGrid();
         syncAppChromeState();
       } else if (data.type === 'conversation_loaded') {
+        pendingReattachCid = '';
         const msgNav = Number(data.nav_seq);
         if (Number.isFinite(msgNav) && msgNav < lastAppliedNavSeq) return;
         if (Number.isFinite(msgNav) && msgNav > lastAppliedNavSeq) lastAppliedNavSeq = msgNav;
@@ -5625,7 +5638,8 @@
         totalConvMessages = 0;
         activeConvId = '';
         activeConvTitle = '';
-        if (!keepAsst) activeConvStore = '';
+        if (typeof data.target_store === 'string') activeConvStore = data.target_store;
+        else if (!keepAsst) activeConvStore = '';
         try { sessionStorage.removeItem('stayy_active_conv_v1'); } catch (_) {}
         branchingInFlight = false;
         const matchedBranchDraft = data.req_id ? branchDraftByReq.get(data.req_id) : '';
@@ -5749,10 +5763,25 @@
           branchingInFlight = false;
           branchDraftByReq.delete(data.req_id);
         }
-        if (String(data.text || '').includes('未找到该对话记录') && !activeConvId) {
+        if (String(data.text || '').includes('未找到该对话记录') && (pendingReattachCid || !activeConvId)) {
+          const missedCid = pendingReattachCid;
+          pendingReattachCid = '';
           try { sessionStorage.removeItem('stayy_active_conv_v1'); } catch (_) {}
+          if (missedCid && outboundQueue.length) {
+            const beforeLen = outboundQueue.length;
+            for (let qi = outboundQueue.length - 1; qi >= 0; qi--) {
+              const qSlot = String(outboundQueue[qi].slot || '');
+              if (qSlot === missedCid || qSlot.endsWith(':' + missedCid)) {
+                outboundQueue.splice(qi, 1);
+              }
+            }
+            if (outboundQueue.length < beforeLen) {
+              showToast('原对话已失效，已取消待发往旧对话的消息以免错投', 3600);
+            }
+          }
           renderHeroDeck();
           syncAppChromeState();
+          if (ws && ws.readyState === 1) flushOutboundQueue(ws);
         }
         showToast(data.text);
       }
@@ -5849,7 +5878,7 @@
       wakeWatchdogActive = true;
       try {
         targetWs.send(JSON.stringify({ type: 'ping', ts: now }));
-        if (!isStreaming && (activeConvStore === 'ide' || activeConvStore === 'codex') && activeConvId) {
+        if (!isStreaming && activeConvStore && activeConvId) {
           targetWs.send(JSON.stringify({
             type: 'refresh_conversation',
             conversation_id: activeConvId,
@@ -5899,6 +5928,8 @@
 
   async function uploadFile(file) {
     if (!ws || ws.readyState !== 1) return showToast('尚未连接服务器');
+    if (!file || file.size <= 0) return showToast('无法上传空文件');
+    if (file.size > 100 * 1024 * 1024) return showToast('文件超过 100MB 上限');
     const uid = Math.random().toString(36).slice(2, 10);
     showToast(`正在上传 ${file.name}...`);
     if (!safeWsSend({ type: 'upload_init', upload_id: uid, name: file.name, size: file.size })) {
@@ -5915,10 +5946,12 @@
       }
       const slice = file.slice(offset, offset + chunkSize);
       const buf = await slice.arrayBuffer();
-      let binary = '';
       const bytes = new Uint8Array(buf);
-      for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
-      if (!safeWsSend({ type: 'upload_chunk', upload_id: uid, data: btoa(binary) })) {
+      const parts = [];
+      for (let i = 0; i < bytes.length; i += 0x8000) {
+        parts.push(String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000)));
+      }
+      if (!safeWsSend({ type: 'upload_chunk', upload_id: uid, data: btoa(parts.join('')) })) {
         return showToast('上传中断，请稍后重试');
       }
     }
@@ -5926,6 +5959,7 @@
   }
 
   function clearOptimisticPlaceholder() {
+    optimisticWaitClientId = '';
     if (optimisticWaitRowId) {
       const el = document.getElementById(optimisticWaitRowId);
       if (el) el.remove();
@@ -5990,6 +6024,7 @@
     if (isConnected) {
       if (!steeringMidTurn) {
         showOptimisticPlaceholder();
+        optimisticWaitClientId = clientId;
         setStreamingState(true);
       }
       ws.send(JSON.stringify(payload));
@@ -6059,6 +6094,18 @@
     token = v;
     try { localStorage.setItem('stayy_token', token); } catch (_) {}
     syncManifestToken();
+    connEpoch++;
+    connectingBeacon = false;
+    clearTimeout(reconnectTimer);
+    reconnectTimer = null;
+    clearConnectWatchdog();
+    clearPongWatchdog();
+    if (ws) {
+      const oldWs = ws;
+      ws = null;
+      try { oldWs.close(); } catch (_) {}
+    }
+    reconnectAttempt = 0;
     connect();
   };
 
@@ -6329,7 +6376,7 @@
     try { sessionStorage.removeItem('stayy_active_conv_v1'); } catch (_) {}
     if (activeConvId || renderedIds.size > 0 || isStreaming) {
       if (ws && ws.readyState === 1) {
-        startNewConversation('', 'ide', false);
+        startNewConversation('', activeConvStore || newChatTarget || 'ide', false);
       } else {
         activeConvId = '';
         activeConvStore = '';
@@ -6970,7 +7017,7 @@
             left.textContent = it.title || '未命名会话';
             const right = document.createElement('span');
             right.className = it.store === 'codex' ? 'conv-tag codex' : 'conv-tag ide';
-            right.textContent = it.store === 'codex' ? 'Codex' : (it.store === 'ide' ? 'Antigravity' : '远程');
+            right.textContent = storeDisplayName(it.store);
             b.appendChild(left);
             b.appendChild(right);
             b.onclick = () => {

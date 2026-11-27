@@ -177,7 +177,8 @@ def api_sessions_dir(runtime_dir: Path, store: str) -> Path:
 
 
 def load_api_session_history(runtime_dir: Path, store: str, session_id: str) -> list[dict[str, Any]]:
-    fp = api_sessions_dir(runtime_dir, store) / f"{_safe_session_id(session_id)}.json"
+    safe_store = re.sub(r"[^A-Za-z0-9_.-]", "_", store or "api")
+    fp = runtime_dir / "api_sessions" / safe_store / f"{_safe_session_id(session_id)}.json"
     if not fp.is_file():
         return []
     try:
@@ -215,6 +216,50 @@ def save_api_session_record(
     restrict_file_to_current_user(fp)
 
 
+MAX_SSE_LINE_BYTES = 2 * 1024 * 1024
+MAX_HTTP_ERROR_BODY_BYTES = 65536
+
+
+def _extract_non_sse_json_response(
+    raw_json_str: str,
+    *,
+    api_key: str,
+    loop: asyncio.AbstractEventLoop,
+    out_q: asyncio.Queue[tuple[str, str]],
+) -> bool:
+    """Handle HTTP 200 JSON responses (error envelope or non-streaming completion)."""
+    try:
+        obj = json.loads(raw_json_str)
+    except json.JSONDecodeError:
+        return False
+    if not isinstance(obj, dict):
+        return False
+    if obj.get("error"):
+        err_obj = obj["error"]
+        msg = (
+            err_obj.get("message")
+            if isinstance(err_obj, dict)
+            else str(err_obj)
+        ) or str(obj)
+        if api_key:
+            msg = str(msg).replace(api_key, "***")
+        loop.call_soon_threadsafe(out_q.put_nowait, ("error", f"API 返回错误：{msg}"))
+        return True
+    choices = obj.get("choices")
+    if isinstance(choices, list) and choices:
+        first = choices[0] if isinstance(choices[0], dict) else {}
+        msg_obj = first.get("message") if isinstance(first.get("message"), dict) else {}
+        thought = str(msg_obj.get("reasoning_content") or msg_obj.get("reasoning") or "")
+        content = str(msg_obj.get("content") or first.get("text") or "")
+        if thought:
+            loop.call_soon_threadsafe(out_q.put_nowait, ("thought", thought))
+        if content:
+            loop.call_soon_threadsafe(out_q.put_nowait, ("delta", content))
+        loop.call_soon_threadsafe(out_q.put_nowait, ("done", ""))
+        return True
+    return False
+
+
 async def run_openai_compat_turn(
     *,
     store: str,
@@ -234,8 +279,8 @@ async def run_openai_compat_turn(
 ) -> AgentRunResult:
     """Stream an OpenAI-compatible SSE completion turn cleanly via endpoint-pinned HTTP(S) transport."""
     cb = callbacks or AgentTurnCallbacks()
-    ok_url, reason, pinned_ips, is_lb = validate_llm_endpoint_url(
-        base_url, allow_local_ports=allow_local_ports
+    ok_url, reason, pinned_ips, is_lb = await asyncio.to_thread(
+        validate_llm_endpoint_url, base_url, allow_local_ports=allow_local_ports
     )
     if not ok_url:
         return AgentRunResult(ok=False, error=reason)
@@ -335,7 +380,9 @@ async def run_openai_compat_turn(
                 loop.call_soon_threadsafe(out_q.put_nowait, ("error", f"出于 SSRF 安全限制已禁止 {resp.status} 重定向"))
                 return
             if resp.status < 200 or resp.status >= 300:
-                err_snippet = resp.read(512).decode("utf-8", errors="replace").strip()
+                err_snippet = resp.read(MAX_HTTP_ERROR_BODY_BYTES).decode("utf-8", errors="replace").strip()
+                if len(err_snippet) > 512:
+                    err_snippet = err_snippet[:512] + "…"
                 if api_key:
                     err_snippet = err_snippet.replace(api_key, "***")
                 loop.call_soon_threadsafe(
@@ -343,6 +390,60 @@ async def run_openai_compat_turn(
                     ("error", f"API 请求失败 (HTTP {resp.status}): {err_snippet or resp.reason}"),
                 )
                 return
+
+            ctype = (resp.getheader("Content-Type") or "").lower()
+            if "application/json" in ctype and "text/event-stream" not in ctype:
+                raw_json = resp.read(MAX_HTTP_ERROR_BODY_BYTES).decode("utf-8", errors="replace").strip()
+                if _extract_non_sse_json_response(raw_json, api_key=api_key, loop=loop, out_q=out_q):
+                    return
+                masked = raw_json.replace(api_key, "***") if api_key else raw_json
+                loop.call_soon_threadsafe(
+                    out_q.put_nowait,
+                    ("error", f"API 返回无法解析的 JSON 响应：{masked[:300]}"),
+                )
+                return
+
+            def _emit_sse_chunk(chunk: dict[str, Any]) -> str:
+                if chunk.get("error"):
+                    err_obj = chunk["error"]
+                    msg = (err_obj.get("message") if isinstance(err_obj, dict) else str(err_obj)) or str(chunk)
+                    if api_key:
+                        msg = str(msg).replace(api_key, "***")
+                    loop.call_soon_threadsafe(out_q.put_nowait, ("error", f"API 流返回错误：{msg}"))
+                    return "error"
+                choices = chunk.get("choices") or []
+                if not choices:
+                    return "emitted"
+                delta = choices[0].get("delta")
+                if not isinstance(delta, dict):
+                    msg_obj = choices[0].get("message")
+                    delta = msg_obj if isinstance(msg_obj, dict) else {}
+                if delta.get("reasoning_content"):
+                    loop.call_soon_threadsafe(out_q.put_nowait, ("thought", str(delta["reasoning_content"])))
+                if delta.get("content"):
+                    loop.call_soon_threadsafe(out_q.put_nowait, ("delta", str(delta["content"])))
+                return "emitted"
+
+            def _flush_sse_data(buf: list[str]) -> str:
+                if not buf:
+                    return "continue"
+                payload_s = "\n".join(buf).strip()
+                buf.clear()
+                if not payload_s:
+                    return "continue"
+                if payload_s == "[DONE]":
+                    return "done"
+                try:
+                    chunk = json.loads(payload_s)
+                except json.JSONDecodeError:
+                    return "continue"
+                if not isinstance(chunk, dict):
+                    return "continue"
+                return _emit_sse_chunk(chunk)
+
+            data_buf: list[str] = []
+            saw_sse_frame = False
+            raw_fallback = bytearray()
 
             while True:
                 if cancel_event is not None and cancel_event.is_set():
@@ -353,29 +454,88 @@ async def run_openai_compat_turn(
                         out_q.put_nowait, ("error", f"API 流式响应超过 {int(total_timeout_sec)}s 总时限，已断开")
                     )
                     return
-                raw_line = resp.fp.readline() if hasattr(resp, "fp") and resp.fp else resp.readline()
+                raw_line = resp.readline(MAX_SSE_LINE_BYTES)
                 if not raw_line:
                     break
-                line = raw_line.decode("utf-8", errors="replace").strip()
-                if not line or not line.startswith("data:"):
+                if len(raw_line) >= MAX_SSE_LINE_BYTES and not raw_line.endswith((b"\n", b"\r")):
+                    loop.call_soon_threadsafe(
+                        out_q.put_nowait,
+                        ("error", f"API SSE 单行超过 {MAX_SSE_LINE_BYTES // 1024}KB 安全上限，已断开"),
+                    )
+                    return
+
+                line = raw_line.decode("utf-8", errors="replace").rstrip("\r\n")
+                if not line:
+                    res_state = _flush_sse_data(data_buf)
+                    if res_state == "done":
+                        break
+                    if res_state == "error":
+                        return
                     continue
-                data_s = line[5:].strip()
-                if data_s == "[DONE]":
-                    break
-                try:
-                    chunk = json.loads(data_s)
-                except json.JSONDecodeError:
+
+                if line.startswith(":"):
+                    saw_sse_frame = True
                     continue
-                choices = chunk.get("choices") or []
-                if not choices:
+
+                if line.startswith("data:"):
+                    saw_sse_frame = True
+                    part = line[5:]
+                    item = part[1:] if part.startswith(" ") else part
+                    if not data_buf:
+                        stripped_item = item.strip()
+                        if stripped_item == "[DONE]":
+                            break
+                        if stripped_item.startswith("{"):
+                            try:
+                                chunk = json.loads(stripped_item)
+                            except json.JSONDecodeError:
+                                chunk = None
+                            if isinstance(chunk, dict):
+                                if _emit_sse_chunk(chunk) == "error":
+                                    return
+                                continue
+                        data_buf.append(item)
+                    else:
+                        data_buf.append(item)
+                        joined = "\n".join(data_buf).strip()
+                        if joined == "[DONE]":
+                            data_buf.clear()
+                            break
+                        if joined.startswith("{") and joined.endswith("}"):
+                            try:
+                                chunk = json.loads(joined)
+                            except json.JSONDecodeError:
+                                chunk = None
+                            if isinstance(chunk, dict):
+                                data_buf.clear()
+                                if _emit_sse_chunk(chunk) == "error":
+                                    return
                     continue
-                delta = choices[0].get("delta") or {}
-                if not isinstance(delta, dict):
+
+                if line.startswith(("event:", "id:", "retry:")):
+                    saw_sse_frame = True
                     continue
-                if delta.get("reasoning_content"):
-                    loop.call_soon_threadsafe(out_q.put_nowait, ("thought", str(delta["reasoning_content"])))
-                if delta.get("content"):
-                    loop.call_soon_threadsafe(out_q.put_nowait, ("delta", str(delta["content"])))
+
+                if not saw_sse_frame and len(raw_fallback) < MAX_HTTP_ERROR_BODY_BYTES:
+                    take = min(len(raw_line), MAX_HTTP_ERROR_BODY_BYTES - len(raw_fallback))
+                    raw_fallback.extend(raw_line[:take])
+
+            if data_buf:
+                if _flush_sse_data(data_buf) == "error":
+                    return
+
+            if not saw_sse_frame and raw_fallback:
+                fallback_txt = bytes(raw_fallback).decode("utf-8", errors="replace").strip()
+                if fallback_txt:
+                    if _extract_non_sse_json_response(fallback_txt, api_key=api_key, loop=loop, out_q=out_q):
+                        return
+                    masked = fallback_txt.replace(api_key, "***") if api_key else fallback_txt
+                    loop.call_soon_threadsafe(
+                        out_q.put_nowait,
+                        ("error", f"API 返回非 SSE 响应：{masked[:300]}"),
+                    )
+                    return
+
             loop.call_soon_threadsafe(out_q.put_nowait, ("done", ""))
         except Exception as exc:
             err_txt = str(exc)

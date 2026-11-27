@@ -265,5 +265,12 @@ class BarkNotifier:
 
         ok, detail = self._sender_fn(self.push_url, allow_private_host=self.allow_private_host)
         if not ok:
+            with self._lock:
+                self._pending_coalesced = True
+                # Keep short backoff on failed delivery so alerts recover promptly without spamming
+                self._last_sent_mono = max(
+                    self._last_sent_mono,
+                    now - self.cooldown_seconds + min(5.0, self.cooldown_seconds),
+                )
             logger.warning("%s", detail)
         return ok, detail

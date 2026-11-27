@@ -634,6 +634,9 @@ class LauncherApp:
         )
         self._beacon_remote_var = tk.StringVar(value=default_cand_remote)
         self._active_pair_code: str = ""
+        self._active_pair_issued_mono: float = 0.0
+        self._shutdown_done: bool = True
+        self._beacon_target_cache: dict[tuple[str, str], Any] = {}
         self._host_id: str = load_or_create_host_id(RUNTIME_DIR)
         self._qr_mode = tk.StringVar(value="tunnel" if settings.public_base_url else "lan")
         self._qr_photo_ref: list[tk.PhotoImage] = []
@@ -669,6 +672,18 @@ class LauncherApp:
             threading.Thread(
                 target=self._poll_pending_beacon_verification,
                 args=(self._ios_pages_url, self._beacon_pending_nonce),
+                daemon=True,
+            ).start()
+        elif (
+            self.settings.beacon_enabled
+            and self._ios_pages_url
+            and saved_bstate.get("state") == "verified"
+            and saved_bstate.get("host_id") == self._host_id
+            and saved_bstate.get("pages_url") == self._ios_pages_url
+        ):
+            threading.Thread(
+                target=self._verify_persisted_beacon_bg,
+                args=(self._ios_pages_url,),
                 daemon=True,
             ).start()
         self.root.after(160, lambda: self._run_async(self._start_all_worker, False))
@@ -1411,6 +1426,7 @@ class LauncherApp:
         res = self._admin_request("POST", "/admin/pair")
         if res and res.get("ok") and res.get("code"):
             self._active_pair_code = str(res["code"])
+            self._active_pair_issued_mono = time.monotonic()
             self._post_ui(self._render_inline_qr)
 
     def _revoke_tokens_worker(self) -> None:
@@ -1444,6 +1460,7 @@ class LauncherApp:
         pair_res = self._admin_request("POST", "/admin/pair")
         if pair_res and pair_res.get("ok"):
             self._active_pair_code = str(pair_res.get("code") or "")
+            self._active_pair_issued_mono = time.monotonic()
         self._post_ui(self._render_inline_qr)
         self._enqueue_log(
             "安全",
@@ -1632,6 +1649,27 @@ class LauncherApp:
                 self._post_ui(self._render_inline_qr)
                 return
 
+    def _verify_persisted_beacon_bg(self, pages_url: str) -> None:
+        ok, scode, detail = verify_published_beacon(
+            pages_url,
+            self.settings.web_access_token,
+            self._host_id,
+            "",
+            timeout=6.0,
+            ignore_nonce=True,
+        )
+        if self._closing:
+            return
+        if ok:
+            self._beacon_synced = True
+            self._beacon_state = "verified"
+            self._enqueue_log("Tunnel", f"✓ 已核验本机历史信标依然归属当前密钥 -> {pages_url}", "tunnel")
+        elif scode in {"host_conflict", "decrypt_failed", "auth_denied"}:
+            self._beacon_synced = False
+            self._beacon_state = scode
+            self._enqueue_log("Tunnel", f"历史信标核验失效 [{scode}]：{detail}", "warn")
+        self._post_ui(self._render_inline_qr)
+
     def _render_inline_qr(self) -> None:
         if self._closing:
             return
@@ -1654,11 +1692,17 @@ class LauncherApp:
             if not self._beacon_setup_frame.winfo_ismapped():
                 self._beacon_setup_frame.pack(fill=tk.X, pady=(6, 4))
 
-            cand = resolve_explicit_beacon_target(
-                self.settings.project_dir,
-                beacon_enabled=True,
-                explicit_remote=self._beacon_remote_var.get().strip(),
-            )
+            raw_rem = self._beacon_remote_var.get().strip()
+            cache_key = (raw_rem, self.settings.beacon_branch)
+            if cache_key in self._beacon_target_cache:
+                cand = self._beacon_target_cache[cache_key]
+            else:
+                cand = resolve_explicit_beacon_target(
+                    self.settings.project_dir,
+                    beacon_enabled=True,
+                    explicit_remote=raw_rem,
+                )
+                self._beacon_target_cache[cache_key] = cand
             target_line = (
                 f"目标：{cand[1]}/{cand[2]} ({self.settings.beacon_branch})\n入口：{cand[3]}"
                 if cand
@@ -1735,25 +1779,40 @@ class LauncherApp:
         if self._qr_mode.get() == "ios" and not self.settings.public_base_url and not self._beacon_synced:
             self.qr_url_lbl.configure(text="⚠ 请先点击「一键启用并同步信标」并等待验真")
             return
-        # Mint a fresh one-time pairing link when available so repeated copies never collide
-        res = self._admin_request("POST", "/admin/pair")
-        if res and res.get("ok") and res.get("code"):
-            self._active_pair_code = str(res["code"])
-        lan_ip = get_lan_ipv4()
-        fallback = f"http://{lan_ip}:{self.settings.web_pwa_port}/?token={self.settings.web_access_token}"
-        u = self._current_qr_url() or fallback
-        self.root.clipboard_clear()
-        self.root.clipboard_append(u)
-        self._render_inline_qr()
-        self.qr_url_lbl.configure(text="✓ 已复制安装/配对链接！")
+        self.qr_url_lbl.configure(text="正在生成一次性配对链接...")
+
+        def _worker() -> None:
+            res = self._admin_request("POST", "/admin/pair")
+            new_code = str(res["code"]) if (res and res.get("ok") and res.get("code")) else ""
+            lan_ip = get_lan_ipv4()
+
+            def _apply() -> None:
+                if self._closing:
+                    return
+                if new_code:
+                    self._active_pair_code = new_code
+                    self._active_pair_issued_mono = time.monotonic()
+                fallback = f"http://{lan_ip}:{self.settings.web_pwa_port}/?token={self.settings.web_access_token}"
+                u = self._current_qr_url() or fallback
+                self.root.clipboard_clear()
+                self.root.clipboard_append(u)
+                self._render_inline_qr()
+                self.qr_url_lbl.configure(text="✓ 已复制安装/配对链接！")
+
+            self._post_ui(_apply)
+
+        threading.Thread(target=_worker, daemon=True).start()
 
     def _open_local_browser(self) -> None:
-        res = self._admin_request("POST", "/admin/pair")
-        if res and res.get("ok") and res.get("code"):
-            url = f"http://127.0.0.1:{self.settings.web_pwa_port}/?pair={res['code']}"
-        else:
-            url = f"http://127.0.0.1:{self.settings.web_pwa_port}/?token={self.settings.web_access_token}"
-        webbrowser.open(url)
+        def _worker() -> None:
+            res = self._admin_request("POST", "/admin/pair")
+            if res and res.get("ok") and res.get("code"):
+                url = f"http://127.0.0.1:{self.settings.web_pwa_port}/?pair={res['code']}"
+            else:
+                url = f"http://127.0.0.1:{self.settings.web_pwa_port}/?token={self.settings.web_access_token}"
+            self._post_ui(lambda target=url: webbrowser.open(target))
+
+        threading.Thread(target=_worker, daemon=True).start()
 
     def _check_firewall_bg(self) -> None:
         ok = is_lan_firewall_rule_present(self.settings.web_pwa_port)
@@ -1874,10 +1933,14 @@ class LauncherApp:
             return
         gw_ident = probe_stayy_gateway_identity("127.0.0.1", self.settings.web_pwa_port, timeout=0.45)
         pwa_open = gw_ident == "stayy"
-        if pwa_open and not self._active_pair_code:
+        if pwa_open and (
+            not self._active_pair_code
+            or (time.monotonic() - self._active_pair_issued_mono) >= 240.0
+        ):
             res = self._admin_request("POST", "/admin/pair")
             if res and res.get("ok") and res.get("code"):
                 self._active_pair_code = str(res["code"])
+                self._active_pair_issued_mono = time.monotonic()
                 self._post_ui(self._render_inline_qr)
         srv_alive = self._server_proc is not None and self._server_proc.poll() is None
         tun_alive = self._tunnel_proc is not None and self._tunnel_proc.poll() is None
@@ -2110,7 +2173,7 @@ class LauncherApp:
             env["PATH"] = f"{agy_bin};{env.get('PATH', '')}"
 
         cmd = [str(py_exe), "-X", "utf8", "-u", "-m", "stayy.main"]
-        self._enqueue_log("系统", "正在拉起反重力核心会话服务...", "sys")
+        self._enqueue_log("系统", "正在拉起 Stayy 核心网关服务...", "sys")
         try:
             self._server_proc = subprocess.Popen(
                 cmd,
@@ -2350,18 +2413,27 @@ class LauncherApp:
 
             self._desired_running = False
             self._closing = True
+            self._shutdown_done = False
             self.root.withdraw()
+            shutdown_deadline = time.monotonic() + 6.0
 
             def _shutdown_bg() -> None:
                 try:
                     self._stop_all_internal(include_external=False)
                 finally:
+                    self._shutdown_done = True
+
+            def _poll_shutdown() -> None:
+                if self._shutdown_done or time.monotonic() >= shutdown_deadline:
                     try:
                         self.root.quit()
                     except Exception:
                         pass
+                    return
+                self.root.after(60, _poll_shutdown)
 
             threading.Thread(target=_shutdown_bg, daemon=True).start()
+            self.root.after(60, _poll_shutdown)
             return
 
         self._closing = True
