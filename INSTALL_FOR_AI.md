@@ -15,6 +15,12 @@ Stayy requires at least one of the following installed on Windows (the setup doc
 
 ## Step 2: Create Isolated Virtual Environment & Install Dependencies
 
+**Option A (`uv` locked install — recommended):**
+```powershell
+uv sync --locked
+```
+
+**Option B (`venv` + `pip` editable install):**
 ```powershell
 uv venv --python 3.12 .venv
 uv pip install --python .\.venv\Scripts\python.exe -e ".[dev]"
@@ -30,8 +36,9 @@ uv pip install --python .\.venv\Scripts\python.exe -e ".[dev]"
 
 Notes:
 - Default port is **`8766`** (kept isolated from any other local bridge on `:8765`).
-- `AGY_DANGEROUSLY_SKIP_PERMISSIONS` defaults to **`false`** for safety.
+- Safe-by-default permissions: `AGY_DANGEROUSLY_SKIP_PERMISSIONS=false`, `REMOTE_DESKTOP_ENABLED=false`, and `REMOTE_CLIPBOARD_ENABLED=false` (you can toggle desktop touch/clipboard live from the **Stayy** window header).
 - `BEACON_ENABLED` defaults to **`false`** — you do NOT need GitHub Pages credentials or upstream push access to use Stayy via LAN, Tailscale (`PUBLIC_BASE_URL`), or Quick Tunnel.
+- Upgrading from an older `.env`? Missing toggles safely default to `false`; compare against [`.env.example`](.env.example) or toggle capabilities directly in the launcher UI.
 - The JSON output intentionally **redacts all tokens and push URLs**. Confirm `"ok": true` in the JSON output.
 
 ## Step 4: Verify Security Gates & Test Suite

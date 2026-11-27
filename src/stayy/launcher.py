@@ -344,6 +344,8 @@ class LauncherSettings:
     web_pwa_port: int
     web_access_token: str
     tunnel_enabled: bool
+    remote_desktop_enabled: bool
+    remote_clipboard_enabled: bool
     beacon_enabled: bool
     beacon_git_remote: str
     beacon_branch: str
@@ -367,6 +369,8 @@ def load_settings() -> LauncherSettings:
     raw_web_tok = str(env_data.get("WEB_ACCESS_TOKEN") or "").strip()
     web_tok = ensure_web_access_token(env_file, raw_web_tok) if web_pwa_enabled else raw_web_tok
     tunnel_enabled = _bool_env(env_data.get("CLOUDFLARE_TUNNEL_ENABLED"), True)
+    remote_desktop_enabled = _bool_env(env_data.get("REMOTE_DESKTOP_ENABLED"), False)
+    remote_clipboard_enabled = _bool_env(env_data.get("REMOTE_CLIPBOARD_ENABLED"), False)
     beacon_enabled = _bool_env(env_data.get("BEACON_ENABLED"), False)
     beacon_git_remote = str(env_data.get("BEACON_GIT_REMOTE") or "").strip()
     beacon_branch = str(env_data.get("BEACON_BRANCH") or "gh-pages").strip() or "gh-pages"
@@ -379,6 +383,8 @@ def load_settings() -> LauncherSettings:
         web_pwa_port=web_pwa_port,
         web_access_token=web_tok,
         tunnel_enabled=tunnel_enabled,
+        remote_desktop_enabled=remote_desktop_enabled,
+        remote_clipboard_enabled=remote_clipboard_enabled,
         beacon_enabled=beacon_enabled,
         beacon_git_remote=beacon_git_remote,
         beacon_branch=beacon_branch,
@@ -710,7 +716,9 @@ class LauncherApp:
         self._shutdown_done: bool = True
         self._beacon_target_cache: dict[tuple[str, str], Any] = {}
         self._host_id: str = load_or_create_host_id(RUNTIME_DIR)
-        self._qr_mode = tk.StringVar(value="tunnel" if settings.public_base_url else "lan")
+        self._qr_mode = tk.StringVar(
+            value="tunnel" if (settings.public_base_url or settings.tunnel_enabled) else "lan"
+        )
         self._qr_photo_ref: list[tk.PhotoImage] = []
         self._conv_stats_str = "正在扫描电脑端会话..."
 
@@ -721,6 +729,8 @@ class LauncherApp:
         self._show_debug_var = tk.BooleanVar(value=False)
         self._autostart_var = tk.BooleanVar(value=is_autostart_enabled())
         self._keep_awake_var = tk.BooleanVar(value=bool(self._prefs.get("keep_awake", True)))
+        self._remote_desktop_var = tk.BooleanVar(value=settings.remote_desktop_enabled)
+        self._remote_clipboard_var = tk.BooleanVar(value=settings.remote_clipboard_enabled)
 
         self._img_cache: dict[tuple, tk.PhotoImage] = {}
         self._orbs: dict[str, tk.PhotoImage] = {}
@@ -970,6 +980,41 @@ class LauncherApp:
             text="开机静默自启",
             variable=self._autostart_var,
             command=self._on_toggle_autostart,
+            bg=self.BG,
+            fg=self.TEXT_SECONDARY,
+            selectcolor="#101B2D",
+            activebackground=self.BG,
+            activeforeground=self.TEXT_PRIMARY,
+            font=("Microsoft YaHei UI", 8),
+            bd=0,
+            highlightthickness=0,
+            cursor="hand2",
+        ).pack(side=tk.LEFT)
+
+        cap_row = tk.Frame(right_hdr, bg=self.BG)
+        cap_row.pack(side=tk.TOP, anchor="e", pady=(4, 0))
+
+        tk.Checkbutton(
+            cap_row,
+            text="允许远程桌面触控",
+            variable=self._remote_desktop_var,
+            command=self._on_toggle_remote_desktop,
+            bg=self.BG,
+            fg=self.TEXT_SECONDARY,
+            selectcolor="#101B2D",
+            activebackground=self.BG,
+            activeforeground=self.TEXT_PRIMARY,
+            font=("Microsoft YaHei UI", 8),
+            bd=0,
+            highlightthickness=0,
+            cursor="hand2",
+        ).pack(side=tk.LEFT, padx=(0, 12))
+
+        tk.Checkbutton(
+            cap_row,
+            text="允许远程剪贴板",
+            variable=self._remote_clipboard_var,
+            command=self._on_toggle_remote_clipboard,
             bg=self.BG,
             fg=self.TEXT_SECONDARY,
             selectcolor="#101B2D",
@@ -1477,16 +1522,29 @@ class LauncherApp:
             pass
         return None
 
-    def _admin_request(self, method: str, path: str, timeout: float = 2.0) -> dict[str, Any] | None:
+    def _admin_request(
+        self,
+        method: str,
+        path: str,
+        timeout: float = 2.0,
+        payload: dict[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
         st = self._read_admin_state()
         if not st:
             return None
         opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        headers = {"X-Admin-Token": str(st["admin_token"])}
+        body_bytes: bytes | None = None
+        if payload is not None:
+            body_bytes = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+            headers["Content-Type"] = "application/json; charset=utf-8"
+        elif method.upper() == "POST":
+            body_bytes = b"{}"
         req = urllib.request.Request(
             f"http://127.0.0.1:{int(st['port'])}{path}",
             method=method.upper(),
-            data=(b"{}" if method.upper() == "POST" else None),
-            headers={"X-Admin-Token": str(st["admin_token"])},
+            data=body_bytes,
+            headers=headers,
         )
         try:
             with opener.open(req, timeout=timeout) as resp:
@@ -1551,19 +1609,19 @@ class LauncherApp:
         tok = self.settings.web_access_token
         mode = self._qr_mode.get()
         pair = self._active_pair_code
-        query_suffix = f"?pair={pair}" if pair else f"?token={tok}"
+        frag_suffix = f"#pair={pair}" if pair else ""
         if mode == "ios":
             if self.settings.public_base_url:
-                return f"{self.settings.public_base_url.rstrip('/')}/{query_suffix}"
+                return f"{self.settings.public_base_url.rstrip('/')}/{frag_suffix}" if frag_suffix else ""
             if self._ios_pages_url and self._beacon_synced:
                 # Fragment `#key=` stays strictly client-side and never enters CDN logs!
                 return f"{self._ios_pages_url}#key={tok}"
             return ""
         if mode == "tunnel":
             base = self.settings.public_base_url or self._tunnel_url
-            return f"{base.rstrip('/')}/{query_suffix}" if base else ""
+            return f"{base.rstrip('/')}/{frag_suffix}" if (base and frag_suffix) else ""
         lan_ip = get_lan_ipv4()
-        return f"http://{lan_ip}:{self.settings.web_pwa_port}/{query_suffix}"
+        return f"http://{lan_ip}:{self.settings.web_pwa_port}/{frag_suffix}" if frag_suffix else ""
 
     def _switch_qr_mode(self, mode: str) -> None:
         self._qr_mode.set(mode)
@@ -1815,11 +1873,24 @@ class LauncherApp:
 
         target_u = self._current_qr_url()
         if not target_u:
-            self.qr_img_lbl.configure(
-                image="",
-                text="\n正在建立外网连接...\n（同 Wi-Fi 可点 Wi-Fi 扫码，或配置 Tailscale）\n",
-            )
-            self.qr_url_lbl.configure(text="等待公网/隧道地址就绪")
+            if m == "lan":
+                self.qr_img_lbl.configure(
+                    image="",
+                    text="\n正在向本机网关申请一次性配对码...\n请稍候 1~3 秒，或点击下方「刷码」\n",
+                )
+                self.qr_url_lbl.configure(text="等待一次性配对码")
+            elif m == "tunnel" and (self.settings.public_base_url or self._tunnel_url):
+                self.qr_img_lbl.configure(
+                    image="",
+                    text="\n外网入口已就绪，正在生成一次性配对码...\n请稍候 1~3 秒，或点击下方「刷码」\n",
+                )
+                self.qr_url_lbl.configure(text="等待一次性配对码")
+            else:
+                self.qr_img_lbl.configure(
+                    image="",
+                    text="\n正在建立外网连接...\n（同 Wi-Fi 可点 Wi-Fi 扫码，或配置 Tailscale）\n",
+                )
+                self.qr_url_lbl.configure(text="等待公网/隧道地址就绪")
             return
 
         try:
@@ -1841,8 +1912,11 @@ class LauncherApp:
                         else "固定公网入口 (一次性配对码)"
                     )
                 )
+            elif m == "lan":
+                masked = target_u.split("#")[0].split("?")[0]
+                self.qr_url_lbl.configure(text=f"仅限可信内网 · {masked} (一次性配对码)")
             else:
-                masked = target_u.split("?")[0] + (" (一次性配对码)" if self._active_pair_code else "")
+                masked = target_u.split("#")[0].split("?")[0] + (" (一次性配对码)" if self._active_pair_code else "")
                 self.qr_url_lbl.configure(text=masked)
         except Exception as exc:
             self.qr_img_lbl.configure(image="", text=f"二维码渲染失败：{exc}")
@@ -1856,7 +1930,6 @@ class LauncherApp:
         def _worker() -> None:
             res = self._admin_request("POST", "/admin/pair")
             new_code = str(res["code"]) if (res and res.get("ok") and res.get("code")) else ""
-            lan_ip = get_lan_ipv4()
 
             def _apply() -> None:
                 if self._closing:
@@ -1864,12 +1937,15 @@ class LauncherApp:
                 if new_code:
                     self._active_pair_code = new_code
                     self._active_pair_issued_mono = time.monotonic()
-                fallback = f"http://{lan_ip}:{self.settings.web_pwa_port}/?token={self.settings.web_access_token}"
-                u = self._current_qr_url() or fallback
+                u = self._current_qr_url()
+                if not u:
+                    self._render_inline_qr()
+                    self.qr_url_lbl.configure(text="⚠ 服务或通道未就绪，暂无法生成配对链接")
+                    return
                 self.root.clipboard_clear()
                 self.root.clipboard_append(u)
                 self._render_inline_qr()
-                self.qr_url_lbl.configure(text="✓ 已复制安装/配对链接！")
+                self.qr_url_lbl.configure(text="✓ 已复制一次性配对链接！")
 
             self._post_ui(_apply)
 
@@ -1879,9 +1955,9 @@ class LauncherApp:
         def _worker() -> None:
             res = self._admin_request("POST", "/admin/pair")
             if res and res.get("ok") and res.get("code"):
-                url = f"http://127.0.0.1:{self.settings.web_pwa_port}/?pair={res['code']}"
+                url = f"http://127.0.0.1:{self.settings.web_pwa_port}/#pair={res['code']}"
             else:
-                url = f"http://127.0.0.1:{self.settings.web_pwa_port}/?token={self.settings.web_access_token}"
+                url = f"http://127.0.0.1:{self.settings.web_pwa_port}/"
             self._post_ui(lambda target=url: webbrowser.open(target))
 
         threading.Thread(target=_worker, daemon=True).start()
@@ -1940,6 +2016,30 @@ class LauncherApp:
         set_prevent_system_sleep(want and self._desired_running)
         msg = "已开启防自动休眠保活（屏幕仍可正常熄灭省电）。" if want else "已关闭防休眠保活。"
         self._enqueue_log("系统", msg, "sys")
+
+    def _apply_capability_toggle(self, env_key: str, payload_key: str, want: bool, label: str) -> None:
+        def _worker() -> None:
+            env_path = self.settings.project_dir / ".env"
+            ok_env = atomic_update_env_vars(env_path, {env_key: "true" if want else "false"})
+            self.settings = load_settings()
+            res = self._admin_request("POST", "/admin/capabilities", payload={payload_key: want})
+            state_txt = "已开启" if want else "已关闭"
+            if res and res.get("ok"):
+                self._enqueue_log("安全", f"{state_txt}「{label}」（已实时下发至在线网关）。", "sys")
+            elif ok_env:
+                self._enqueue_log("安全", f"{state_txt}「{label}」（已写入 .env，网关启动后生效）。", "sys")
+            else:
+                self._enqueue_log("安全", f"更新「{label}」配置失败（无法写入 .env）。", "err")
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _on_toggle_remote_desktop(self) -> None:
+        want = bool(self._remote_desktop_var.get())
+        self._apply_capability_toggle("REMOTE_DESKTOP_ENABLED", "remote_desktop", want, "远程桌面触控")
+
+    def _on_toggle_remote_clipboard(self) -> None:
+        want = bool(self._remote_clipboard_var.get())
+        self._apply_capability_toggle("REMOTE_CLIPBOARD_ENABLED", "remote_clipboard", want, "远程剪贴板读写")
 
     def _enqueue_log(self, source: str, message: str, tag: str = "sys") -> None:
         ts = datetime.now().strftime("%H:%M:%S")
@@ -2339,7 +2439,7 @@ class LauncherApp:
             if which_cf and Path(which_cf).is_file():
                 cf_exe = Path(which_cf)
             else:
-                self._enqueue_log("系统", "未检测到 cloudflared.exe，当前可通过同 Wi-Fi 1ms 扫码直连。", "warn")
+                self._enqueue_log("系统", "未检测到 cloudflared.exe，当前可通过同 Wi-Fi 局域网扫码配对。", "warn")
                 return
 
         self._tunnel_gen += 1

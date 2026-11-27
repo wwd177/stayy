@@ -257,8 +257,8 @@ class AuthManager:
             return epoch > 0 and epoch == self.auth_epoch
 
     def issue_pairing_code(self, ttl_sec: float = 300.0) -> str:
-        """Issue a short-lived single-use pairing code for QR/onboarding exchange."""
-        code = secrets.token_urlsafe(12)
+        """Issue a high-entropy short-lived single-use pairing code for QR/onboarding exchange."""
+        code = secrets.token_urlsafe(24)
         now = time.monotonic()
         with self._lock:
             expired = [k for k, exp in self._pairing_codes.items() if exp <= now]
@@ -276,31 +276,41 @@ class AuthManager:
         mac = hmac.new(self._signing_key(epoch), body.encode("utf-8"), hashlib.sha256).hexdigest()[:32]
         return f"{body}.{mac}"
 
-    def _verify_signed_token(self, raw: str, expected_prefix: str, expected_subject: str) -> tuple[bool, int]:
+    @staticmethod
+    def _ct_eq(a: str, b: str) -> bool:
+        return hmac.compare_digest(a.encode("utf-8"), b.encode("utf-8"))
+
+    def _verify_signed_token_with_expiry(
+        self, raw: str, expected_prefix: str, expected_subject: str
+    ) -> tuple[bool, int, int]:
         parts = (raw or "").strip().split(".")
         if len(parts) != 6:
-            return False, 0
+            return False, 0, 0
         prefix, epoch_s, exp_s, subject, nonce, mac_hex = parts
         if prefix != expected_prefix or not nonce:
-            return False, 0
-        if expected_subject and not hmac.compare_digest(subject, expected_subject):
-            return False, 0
+            return False, 0, 0
+        if expected_subject and not self._ct_eq(subject, expected_subject):
+            return False, 0, 0
         try:
             epoch = int(epoch_s)
             exp = int(exp_s)
         except ValueError:
-            return False, 0
+            return False, 0, 0
         if epoch != self.auth_epoch or epoch <= 0:
-            return False, 0
+            return False, 0, 0
         if exp < int(time.time()):
-            return False, 0
+            return False, 0, 0
         body = f"{prefix}.{epoch}.{exp}.{subject}.{nonce}"
         expected_mac = hmac.new(
             self._signing_key(epoch), body.encode("utf-8"), hashlib.sha256
         ).hexdigest()[:32]
-        if not hmac.compare_digest(mac_hex, expected_mac):
-            return False, 0
-        return True, epoch
+        if not self._ct_eq(mac_hex, expected_mac):
+            return False, 0, 0
+        return True, epoch, exp
+
+    def _verify_signed_token(self, raw: str, expected_prefix: str, expected_subject: str) -> tuple[bool, int]:
+        ok, epoch, _ = self._verify_signed_token_with_expiry(raw, expected_prefix, expected_subject)
+        return ok, epoch
 
     def issue_session_token(self, ttl_sec: float = 86400.0 * 30) -> str:
         with self._lock:
@@ -321,21 +331,21 @@ class AuthManager:
     def exchange_pairing_code(
         self, code: str, ip: str, *, session_ttl_sec: float = 86400.0 * 30
     ) -> tuple[bool, str, int]:
-        if self.is_ip_locked(ip):
-            return False, "", 0
         cand = (code or "").strip()
-        if not cand:
-            self.record_auth_failure(ip)
-            return False, "", 0
-
-        now = time.monotonic()
-        matched_key: str | None = None
         with self._lock:
+            if self.is_ip_locked(ip):
+                return False, "", 0
+            if not cand:
+                self.record_auth_failure(ip)
+                return False, "", 0
+
+            now = time.monotonic()
+            matched_key: str | None = None
             for k, exp in list(self._pairing_codes.items()):
                 if exp <= now:
                     self._pairing_codes.pop(k, None)
                     continue
-                if hmac.compare_digest(cand, k):
+                if self._ct_eq(cand, k):
                     matched_key = k
             if matched_key is None:
                 self.record_auth_failure(ip)
@@ -343,6 +353,34 @@ class AuthManager:
             self._pairing_codes.pop(matched_key, None)
             sess_tok = self.issue_session_token(ttl_sec=session_ttl_sec)
             return True, sess_tok, self.auth_epoch
+
+    def verify_credential_with_expiry(
+        self,
+        raw_credential: str,
+        ip: str,
+        *,
+        allow_master: bool = True,
+        record_failure: bool = True,
+    ) -> tuple[bool, int, int]:
+        """Return `(ok, epoch, session_exp_unix)` where `session_exp_unix == 0` for master token."""
+        if self.is_ip_locked(ip):
+            return False, 0, 0
+        cand = (raw_credential or "").strip()
+        if not cand:
+            if record_failure:
+                self.record_auth_failure(ip)
+            return False, 0, 0
+
+        with self._lock:
+            ok_sess, ep, exp_ts = self._verify_signed_token_with_expiry(cand, "s1", "sess")
+            if ok_sess:
+                return True, ep, exp_ts
+            if allow_master and self.access_token and self._ct_eq(cand, self.access_token):
+                return True, self.auth_epoch, 0
+
+        if record_failure:
+            self.record_auth_failure(ip)
+        return False, 0, 0
 
     def verify_credential(
         self,
@@ -352,24 +390,13 @@ class AuthManager:
         allow_master: bool = True,
         record_failure: bool = True,
     ) -> tuple[bool, int]:
-        if self.is_ip_locked(ip):
-            return False, 0
-        cand = (raw_credential or "").strip()
-        if not cand:
-            if record_failure:
-                self.record_auth_failure(ip)
-            return False, 0
-
-        with self._lock:
-            ok_sess, ep = self._verify_signed_token(cand, "s1", "sess")
-            if ok_sess:
-                return True, ep
-            if allow_master and self.access_token and hmac.compare_digest(cand, self.access_token):
-                return True, self.auth_epoch
-
-        if record_failure:
-            self.record_auth_failure(ip)
-        return False, 0
+        ok, ep, _ = self.verify_credential_with_expiry(
+            raw_credential,
+            ip,
+            allow_master=allow_master,
+            record_failure=record_failure,
+        )
+        return ok, ep
 
     def revoke_and_rotate(self, env_path: Path | None = None) -> tuple[bool, str, int]:
         """Atomically persist a newly rotated `WEB_ACCESS_TOKEN` and increment `auth_epoch`.

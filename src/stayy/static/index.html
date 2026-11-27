@@ -3125,6 +3125,13 @@
       <p id="authModalDesc" style="font-size:13.5px; color:var(--text-sec); margin:0 0 14px; line-height:1.55">
         请在电脑端打开「Stayy」直接扫描右侧一次性配对二维码进入，或在此输入访问密钥：
       </p>
+      <div id="pairConfirmBox" style="display:none;margin-bottom:12px">
+        <div style="font-size:12.5px;color:var(--text-muted);background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.08);border-radius:10px;padding:10px 12px;margin-bottom:12px;line-height:1.5">
+          将把当前浏览器配对至电脑端网关（<span id="pairConfirmOrigin"></span>）。<br/>若非本人主动扫码，请取消并勿授权。
+        </div>
+        <button id="pairConfirmBtn" type="button" class="primary-btn" style="margin-bottom:8px">确认配对此设备</button>
+        <button id="pairCancelBtn" type="button" class="pill-btn" style="width:100%;padding:9px">改用访问密钥登录</button>
+      </div>
       <input id="tokenInput" class="token-input" style="margin-bottom:12px" type="password" placeholder="粘贴 WEB_ACCESS_TOKEN" />
       <button id="saveTokenBtn" class="primary-btn">继续</button>
     </div>
@@ -3366,13 +3373,14 @@
     document.documentElement.classList.add('ios-standalone');
   }
 
-  // Extract ?pair= / #key= / ?key= from QR scan or Home Screen Web Clip URL (never keep query tokens in address bar)
+  // Extract #pair= / ?pair= / #key= / ?key= from QR scan or Home Screen Web Clip URL (never keep query tokens in address bar)
   const urlParams = new URLSearchParams(location.search);
   const hashParams = new URLSearchParams((location.hash || '').replace(/^#/, ''));
-  const incomingPair = (urlParams.get('pair') || '').trim();
+  const incomingPair = (hashParams.get('pair') || urlParams.get('pair') || '').trim();
   const incomingQueryKey = (urlParams.get('key') || urlParams.get('token') || '').trim();
   const incomingHashKey = (hashParams.get('key') || hashParams.get('token') || '').trim();
   const incomingToken = incomingHashKey || incomingQueryKey;
+  let pendingPairCode = '';
   let serverCapabilities = null;
   let backendStatus = null;
   let agentCatalog = [];
@@ -3430,7 +3438,10 @@
     });
   }
 
-  if (incomingToken) {
+  if (incomingPair && !isStaticShell) {
+    pendingPairCode = incomingPair;
+    history.replaceState({}, '', location.pathname);
+  } else if (incomingToken) {
     try { localStorage.setItem('stayy_token', incomingToken); } catch (_) {}
     if (isStaticShell && isIOS && !isStandalone) {
       // Store `#key=` strictly in client-side hash fragment (never sent to CDN server logs!)
@@ -3440,8 +3451,34 @@
       history.replaceState({}, '', location.pathname);
     }
   } else if (incomingPair || urlParams.toString()) {
-    // Same-origin HTTP GET `/?pair=...` already exchanged into HttpOnly `stayy_session` cookie
-    history.replaceState({}, '', location.pathname + (location.hash || ''));
+    history.replaceState({}, '', location.pathname);
+  }
+
+  function showPairConfirmModal(pairCode) {
+    pendingPairCode = pairCode;
+    if ($('pairConfirmOrigin')) $('pairConfirmOrigin').textContent = location.host || location.origin;
+    if ($('authModalDesc')) $('authModalDesc').textContent = '已读取一次性配对码，请点击确认完成设备配对：';
+    if ($('pairConfirmBox')) $('pairConfirmBox').style.display = 'block';
+    if ($('tokenInput')) $('tokenInput').style.display = 'none';
+    if ($('saveTokenBtn')) $('saveTokenBtn').style.display = 'none';
+    $('authModal').classList.add('show');
+  }
+
+  function showTokenLoginModal(descText = '') {
+    pendingPairCode = '';
+    if ($('pairConfirmBox')) $('pairConfirmBox').style.display = 'none';
+    if ($('tokenInput')) $('tokenInput').style.display = '';
+    if ($('saveTokenBtn')) $('saveTokenBtn').style.display = '';
+    if ($('authModalDesc') && descText) $('authModalDesc').textContent = descText;
+    $('authModal').classList.add('show');
+  }
+
+  function syncCapabilityControls() {
+    if (!serverCapabilities) return;
+    const deskOn = Boolean(serverCapabilities.remote_desktop && serverCapabilities.remote_desktop.enabled);
+    if (!deskOn && $('deskModal') && $('deskModal').classList.contains('show')) {
+      closeDesktopModal();
+    }
   }
 
   let token = '';
@@ -5328,6 +5365,10 @@
     clearPongWatchdog();
     wakeWatchdogActive = false;
     missedPongCount = 0;
+    if (!isStaticShell && pendingPairCode) {
+      showPairConfirmModal(pendingPairCode);
+      return;
+    }
     if (ws && (ws.readyState === 0 || ws.readyState === 1)) return;
     if (connectingBeacon) return;
 
@@ -5470,6 +5511,7 @@
       }
       if (data.type === 'hello') {
         serverCapabilities = data.capabilities || null;
+        syncCapabilityControls();
         backendStatus = data.backend_status || null;
         agentCatalog = Array.isArray(data.agents) ? data.agents : [];
         renderWsPickerTargets();
@@ -5552,7 +5594,14 @@
           if (!activeStreamMsgId) setStreamingState(false);
         }
         const rcptEl = document.getElementById('rcpt-' + data.client_id);
-        if (rcptEl && data.label) rcptEl.textContent = data.label;
+        if (rcptEl && data.label) {
+          rcptEl.textContent = data.label;
+          if (data.stage === 'delivery_failed' || data.stage === 'steer_failed' || data.stage === 'rejected_full') {
+            rcptEl.style.color = '#f87171';
+          } else {
+            rcptEl.style.color = '';
+          }
+        }
       } else if (data.type === 'ide_actions') {
         renderIdeActionButtons(data.actions || []);
       } else if (data.type === 'ide_action_result') {
@@ -5764,6 +5813,18 @@
         };
         dImg.src = u;
         updateDeskStatusHint(data.ts);
+      } else if (data.type === 'capabilities_update') {
+        serverCapabilities = data.capabilities || serverCapabilities;
+        syncCapabilityControls();
+      } else if (data.type === 'capability_disabled') {
+        if (!serverCapabilities) serverCapabilities = {};
+        if (data.capability) {
+          serverCapabilities[data.capability] = Object.assign({}, serverCapabilities[data.capability] || {}, { enabled: false });
+        }
+        syncCapabilityControls();
+        if (data.capability === 'remote_desktop' && $('deskModal') && $('deskModal').classList.contains('show')) {
+          closeDesktopModal();
+        }
       } else if (data.type === 'upload_done') {
         pendingAttachments.push(data);
         renderPendingAttachments();
@@ -5824,16 +5885,14 @@
         });
         const revokeMsg = ev.code === 4001 ? '配对已撤销或密钥失效，请重新扫码' : '非法来源域名拦截 (4003)';
         subInfo.textContent = revokeMsg;
-        const authDesc = $('authModalDesc');
-        if (authDesc) {
-          authDesc.textContent = ev.code === 4001
-            ? '配对已撤销或密钥已失效（4001）。请回到电脑端打开「Stayy」重新扫描新二维码，或输入最新访问密钥：'
-            : '当前访问来源已被安全策略拦截（4003），请使用合法入口重新进入。';
-        }
         try { localStorage.removeItem('stayy_token'); } catch (_) {}
         token = '';
         syncManifestToken();
-        $('authModal').classList.add('show');
+        showTokenLoginModal(
+          ev.code === 4001
+            ? '配对已撤销或会话已过期（4001）。请回到电脑端「Stayy」重新扫码配对，或输入访问密钥：'
+            : '当前访问来源已被安全策略拦截（4003），请使用合法入口重新进入。'
+        );
         return;
       }
       // Hold in-flight streaming state briefly across sub-second mobile handoffs so UI never flickers!
@@ -6114,11 +6173,81 @@
   }
 
   // Event bindings
-  $('saveTokenBtn').onclick = () => {
+  if ($('pairCancelBtn')) {
+    $('pairCancelBtn').onclick = () => {
+      showTokenLoginModal('请输入电脑端 .env 中的访问密钥（WEB_ACCESS_TOKEN）：');
+    };
+  }
+  if ($('pairConfirmBtn')) {
+    $('pairConfirmBtn').onclick = async () => {
+      if (!pendingPairCode) return;
+      const btn = $('pairConfirmBtn');
+      const code = pendingPairCode;
+      btn.disabled = true;
+      const prevTxt = btn.textContent;
+      btn.textContent = '正在配对...';
+      try {
+        const res = await fetch('/api/pair', {
+          method: 'POST',
+          credentials: 'same-origin',
+          headers: { 'X-Pair-Code': code },
+        });
+        if (res.ok) {
+          pendingPairCode = '';
+          token = '';
+          try { localStorage.removeItem('stayy_token'); } catch (_) {}
+          if ($('pairConfirmBox')) $('pairConfirmBox').style.display = 'none';
+          if ($('tokenInput')) $('tokenInput').style.display = '';
+          if ($('saveTokenBtn')) $('saveTokenBtn').style.display = '';
+          $('authModal').classList.remove('show');
+          reconnectAttempt = 0;
+          connect();
+        } else {
+          showTokenLoginModal('配对码无效或已过期，请回到电脑端刷新二维码，或改用访问密钥登录：');
+        }
+      } catch (_) {
+        showTokenLoginModal('配对请求失败，请检查网络或改用访问密钥登录：');
+      } finally {
+        btn.disabled = false;
+        btn.textContent = prevTxt;
+      }
+    };
+  }
+
+  $('saveTokenBtn').onclick = async () => {
     const v = $('tokenInput').value.trim();
     if (!v) return;
-    token = v;
-    try { localStorage.setItem('stayy_token', token); } catch (_) {}
+    if (!isStaticShell) {
+      const btn = $('saveTokenBtn');
+      btn.disabled = true;
+      const prevTxt = btn.textContent;
+      btn.textContent = '正在验证...';
+      try {
+        const res = await fetch('/api/auth/login', {
+          method: 'POST',
+          credentials: 'same-origin',
+          headers: { 'Authorization': `Bearer ${v}` },
+        });
+        if (!res.ok) {
+          if ($('authModalDesc')) $('authModalDesc').textContent = '访问密钥无效或请求过于频繁，请核对 .env 中的 WEB_ACCESS_TOKEN：';
+          return;
+        }
+        $('tokenInput').value = '';
+        token = '';
+        try { localStorage.removeItem('stayy_token'); } catch (_) {}
+        $('authModal').classList.remove('show');
+      } catch (_) {
+        if ($('authModalDesc')) $('authModalDesc').textContent = '无法连接电脑端网关进行鉴权，请稍后重试：';
+        return;
+      } finally {
+        btn.disabled = false;
+        btn.textContent = prevTxt;
+      }
+    } else {
+      token = v;
+      try { localStorage.setItem('stayy_token', token); } catch (_) {}
+      $('authModal').classList.remove('show');
+    }
     syncManifestToken();
     connEpoch++;
     connectingBeacon = false;
@@ -6360,8 +6489,8 @@
   };
   $('setResetTokenBtn').onclick = () => {
     $('settingsModal').classList.remove('show');
-    $('tokenInput').value = token || '';
-    $('authModal').classList.add('show');
+    $('tokenInput').value = '';
+    showTokenLoginModal('重新输入或更换访问密钥（WEB_ACCESS_TOKEN）：');
   };
   $('topWaveBtn').onclick = openDesktopModal;
 
@@ -8489,7 +8618,11 @@
     msgInput.style.height = Math.min(msgInput.scrollHeight, 136) + 'px';
   }
   refreshSendBtnVisual();
-  connect();
+  if (!isStaticShell && pendingPairCode) {
+    showPairConfirmModal(pendingPairCode);
+  } else {
+    connect();
+  }
 })();
 </script>
 </body>

@@ -549,7 +549,7 @@ async def test_m2_branch_b_approval_tracker_watch_race_and_shared_screen_hub(
         )
 
     tok = "m2-gates-token-123456"
-    cfg = _make_cfg(tmp_path, web_access_token=tok)
+    cfg = _make_cfg(tmp_path, web_access_token=tok, remote_desktop_enabled=True)
     sessions = SessionManager(cfg, command_override=[sys.executable, str(MOCK_AGY)])
     desk_calls: list[str] = []
     pwa = WebPwaServer(

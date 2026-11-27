@@ -510,7 +510,10 @@ class WebPwaServer:
         self.config = config
         self.sessions = session_manager
         self.env_path = env_path
-        self.runtime_dir = runtime_dir or (PROJECT_ROOT / ".runtime")
+        isolated_base = cli_store_dir or ide_store_dir
+        self.runtime_dir = runtime_dir or (
+            (isolated_base.parent / ".runtime") if isolated_base is not None else (PROJECT_ROOT / ".runtime")
+        )
         self.auth = AuthManager(access_token, runtime_dir=self.runtime_dir, env_path=env_path)
         self.admin_secret = (admin_secret or "").strip() or secrets.token_urlsafe(24)
         self.admin_port: int = 0
@@ -602,7 +605,10 @@ class WebPwaServer:
 
         self._clients: set[ServerConnection] = set()
         self._client_epochs: dict[ServerConnection, int] = {}
+        self._client_expiries: dict[ServerConnection, int] = {}
         self._clients_lock = asyncio.Lock()
+        self.remote_desktop_enabled: bool = bool(config.remote_desktop_enabled)
+        self.remote_clipboard_enabled: bool = bool(config.remote_clipboard_enabled)
         self._media_registry: OrderedDict[str, Path] = OrderedDict()
         self._live_frame_registry: OrderedDict[str, Path] = OrderedDict()
         self._tasks: set[asyncio.Task[None]] = set()
@@ -811,6 +817,34 @@ class WebPwaServer:
             return False
         return p.netloc.strip().lower() in self._allowed_origin_set(host_hdr)
 
+    def _is_same_origin_post(self, headers: Headers | None) -> bool:
+        if headers is None:
+            return True
+        sfs = (headers.get("Sec-Fetch-Site") or "").strip().lower()
+        if sfs and sfs not in {"same-origin", "same-site", "none"}:
+            return False
+        origin_hdr = (headers.get("Origin") or "").strip()
+        host_hdr = (headers.get("Host") or "").strip()
+        if origin_hdr:
+            return self._is_allowed_origin(origin_hdr, host_hdr)
+        return True
+
+    def _is_https_request(self, headers: Headers | None) -> bool:
+        xf_proto = (
+            (headers.get("X-Forwarded-Proto") or "").strip().lower()
+            if (headers is not None and self.config.trust_cf_proxy_headers)
+            else ""
+        )
+        return (xf_proto == "https") or self.config.public_base_url.startswith("https://")
+
+    def _session_cookie_header(self, sess_tok: str, headers: Headers | None, *, max_age: int | None = None) -> str:
+        is_https = self._is_https_request(headers)
+        if is_https:
+            age = max_age if max_age is not None else 2592000
+            return f"__Host-stayy_session={sess_tok}; Path=/; Max-Age={age}; HttpOnly; SameSite=Strict; Secure"
+        age = max_age if max_age is not None else 86400
+        return f"stayy_session={sess_tok}; Path=/; Max-Age={age}; HttpOnly; SameSite=Strict"
+
     def _cors_headers(self, headers: Headers | None) -> dict[str, str]:
         if headers is None:
             return {}
@@ -840,9 +874,10 @@ class WebPwaServer:
                 try:
                     jar = SimpleCookie()
                     jar.load(raw_cookie)
-                    morsel = jar.get("stayy_session")
-                    if morsel and morsel.value:
-                        return morsel.value.strip(), ticket
+                    for ck_name in ("__Host-stayy_session", "stayy_session"):
+                        morsel = jar.get(ck_name)
+                        if morsel and morsel.value:
+                            return morsel.value.strip(), ticket
                 except Exception:
                     pass
         return "", ticket
@@ -927,6 +962,27 @@ class WebPwaServer:
             return default
         return max(min_val, min(max_val, f))
 
+    async def _session_expiry_sweep_loop(self) -> None:
+        while True:
+            await asyncio.sleep(3.0)
+            now_unix = int(time.time())
+            expired_ws: list[ServerConnection] = []
+            async with self._clients_lock:
+                for cli in list(self._clients):
+                    ep = self._client_epochs.get(cli, 0)
+                    exp_ts = self._client_expiries.get(cli, 0)
+                    if not self.auth.is_epoch_active(ep) or (exp_ts > 0 and now_unix > exp_ts):
+                        expired_ws.append(cli)
+                        self._clients.discard(cli)
+                        self._client_epochs.pop(cli, None)
+                        self._client_expiries.pop(cli, None)
+            for sws in expired_ws:
+                await self._unsubscribe_live_screen(sws)
+                try:
+                    await asyncio.wait_for(sws.close(code=4001, reason="Session expired"), timeout=0.6)
+                except Exception:
+                    pass
+
     async def revoke_all_tokens(self) -> tuple[bool, int, int]:
         """Atomically rotate master token, increment epoch, clear caches, and disconnect stale WS clients."""
         ok, _result_or_err, new_epoch = self.auth.revoke_and_rotate(self.env_path)
@@ -964,6 +1020,7 @@ class WebPwaServer:
                     stale_ws.append(cli)
                     self._clients.discard(cli)
                     self._client_epochs.pop(cli, None)
+                    self._client_expiries.pop(cli, None)
 
         for sws in stale_ws:
             await self._unsubscribe_live_screen(sws)
@@ -987,6 +1044,7 @@ class WebPwaServer:
             async with self._clients_lock:
                 self._clients.discard(ws)
                 self._client_epochs.pop(ws, None)
+                self._client_expiries.pop(ws, None)
             try:
                 await ws.close()
             except Exception:
@@ -994,11 +1052,16 @@ class WebPwaServer:
             return False
 
     async def _broadcast(self, payload: dict[str, Any]) -> None:
+        now_unix = int(time.time())
         async with self._clients_lock:
             clients_snapshot = [
                 c
                 for c in self._clients
                 if self.auth.is_epoch_active(self._client_epochs.get(c, 0))
+                and (
+                    self._client_expiries.get(c, 0) <= 0
+                    or now_unix <= self._client_expiries.get(c, 0)
+                )
             ]
         if not clients_snapshot:
             return
@@ -1046,6 +1109,76 @@ class WebPwaServer:
             return self._http_response(404, "Not Found", b"Not Found", "text/plain")
 
         req_method = str(getattr(request, "method", "GET") or "GET").upper()
+        ip = self._client_ip(connection, request.headers)
+
+        if req_method == "POST":
+            if path not in {"/api/pair", "/api/auth/login"}:
+                return self._http_response(405, "Method Not Allowed", b"Method Not Allowed", "text/plain")
+            if not self._is_same_origin_post(request.headers):
+                return self._http_response(
+                    403,
+                    "Forbidden",
+                    json.dumps({"ok": False, "error": "forbidden_origin"}).encode("utf-8"),
+                    "application/json; charset=utf-8",
+                    {"Cache-Control": "no-store"},
+                )
+
+            if path == "/api/pair":
+                pair_code = (request.headers.get("X-Pair-Code") or "").strip()
+                is_https = self._is_https_request(request.headers)
+                exp_sec = 2592000 if is_https else 86400
+                ok_pair, issued_sess, _ep = self.auth.exchange_pairing_code(
+                    pair_code, ip, session_ttl_sec=float(exp_sec)
+                )
+                if not ok_pair or not issued_sess:
+                    return self._http_response(
+                        401,
+                        "Unauthorized",
+                        json.dumps({"ok": False, "error": "invalid_or_expired_pairing_code"}).encode("utf-8"),
+                        "application/json; charset=utf-8",
+                        {"Cache-Control": "no-store"},
+                    )
+                return self._http_response(
+                    200,
+                    "OK",
+                    json.dumps({"ok": True, "expires_in": exp_sec}).encode("utf-8"),
+                    "application/json; charset=utf-8",
+                    {
+                        "Cache-Control": "no-store",
+                        "Set-Cookie": self._session_cookie_header(issued_sess, request.headers, max_age=exp_sec),
+                    },
+                )
+
+            # POST /api/auth/login (explicit token submitted via header -> exchange for signed session cookie)
+            auth_hdr = (request.headers.get("Authorization") or "").strip()
+            tok_hdr = (
+                auth_hdr[7:].strip()
+                if auth_hdr.lower().startswith("bearer ")
+                else (request.headers.get("X-Access-Token") or "").strip()
+            )
+            ok_tok, _ = self.auth.verify_credential(tok_hdr, ip, allow_master=True, record_failure=True)
+            if not ok_tok:
+                return self._http_response(
+                    401,
+                    "Unauthorized",
+                    json.dumps({"ok": False, "error": "unauthorized"}).encode("utf-8"),
+                    "application/json; charset=utf-8",
+                    {"Cache-Control": "no-store"},
+                )
+            is_https = self._is_https_request(request.headers)
+            exp_sec = 2592000 if is_https else 86400
+            sess_tok = self.auth.issue_session_token(ttl_sec=float(exp_sec))
+            return self._http_response(
+                200,
+                "OK",
+                json.dumps({"ok": True, "expires_in": exp_sec}).encode("utf-8"),
+                "application/json; charset=utf-8",
+                {
+                    "Cache-Control": "no-store",
+                    "Set-Cookie": self._session_cookie_header(sess_tok, request.headers, max_age=exp_sec),
+                },
+            )
+
         if req_method not in {"GET", "HEAD"}:
             return self._http_response(405, "Method Not Allowed", b"Method Not Allowed", "text/plain")
 
@@ -1054,41 +1187,12 @@ class WebPwaServer:
             if not html_file.is_file():
                 return self._http_response(404, "Not Found", b"Missing index.html", "text/plain")
             body = await asyncio.to_thread(html_file.read_bytes)
-            extra_hdrs: dict[str, str] = {"Cache-Control": "no-cache"}
-            ip = self._client_ip(connection, request.headers)
-            qs = parse_qs(parsed.query)
-            pair_code = (qs.get("pair") or [""])[0].strip()
-            cand_tok = (qs.get("token") or [""])[0].strip()
-
-            xf_proto = (
-                request.headers.get("X-Forwarded-Proto", "").strip().lower()
-                if self.config.trust_cf_proxy_headers
-                else ""
-            )
-            is_https = (xf_proto == "https") or self.config.public_base_url.startswith("https://")
-            sec_attr = "; Secure" if is_https else ""
-
-            sess_tok = ""
-            if pair_code:
-                ok_pair, issued_sess, _ = self.auth.exchange_pairing_code(pair_code, ip)
-                if ok_pair:
-                    sess_tok = issued_sess
-            elif cand_tok:
-                ok_tok, _ = self.auth.verify_credential(cand_tok, ip, record_failure=True)
-                if ok_tok:
-                    sess_tok = self.auth.issue_session_token()
-
-            if sess_tok:
-                extra_hdrs["Set-Cookie"] = (
-                    f"stayy_session={sess_tok}; Path=/; Max-Age=2592000; HttpOnly; SameSite=Lax{sec_attr}"
-                )
-
             return self._http_response(
                 200,
                 "OK",
                 body,
                 "text/html; charset=utf-8",
-                extra_hdrs,
+                {"Cache-Control": "no-cache"},
             )
 
         if path == "/manifest.json":
@@ -1270,7 +1374,7 @@ class WebPwaServer:
 
     def _build_capabilities(self) -> dict[str, Any]:
         bstat = self._build_backend_status()
-        remote_enabled = (sys.platform == "win32") or self._custom_desktop_input
+        hw_desktop = (sys.platform == "win32") or self._custom_desktop_input
         return {
             "ide": {
                 "chat": bstat["ide_available"] or self._pc_window_sender is not None,
@@ -1291,11 +1395,30 @@ class WebPwaServer:
                 "cancel": True,
             },
             "remote_desktop": {
-                "enabled": remote_enabled,
-                "loupe": True,
-                "trackpad": True,
+                "enabled": bool(self.remote_desktop_enabled and hw_desktop),
+                "loupe": bool(self.remote_desktop_enabled),
+                "trackpad": bool(self.remote_desktop_enabled),
+            },
+            "remote_clipboard": {
+                "enabled": bool(self.remote_clipboard_enabled),
             },
         }
+
+    async def set_remote_capabilities(
+        self, *, remote_desktop: bool | None = None, remote_clipboard: bool | None = None
+    ) -> dict[str, Any]:
+        if remote_desktop is not None:
+            self.remote_desktop_enabled = bool(remote_desktop)
+            if not self.remote_desktop_enabled:
+                async with self._screen_lock:
+                    subs_ws = list(self._screen_subs.keys())
+                for sws in subs_ws:
+                    await self._unsubscribe_live_screen(sws)
+        if remote_clipboard is not None:
+            self.remote_clipboard_enabled = bool(remote_clipboard)
+        caps = self._build_capabilities()
+        await self._broadcast({"type": "capabilities_update", "capabilities": caps})
+        return caps
 
     async def _screen_client_sender(self, ws: ServerConnection, q: asyncio.Queue[dict[str, Any]]) -> None:
         timeout_streak = 0
@@ -1303,7 +1426,8 @@ class WebPwaServer:
             while True:
                 frame = await q.get()
                 ep = self._client_epochs.get(ws, 0)
-                if not self.auth.is_epoch_active(ep):
+                exp_ts = self._client_expiries.get(ws, 0)
+                if not self.auth.is_epoch_active(ep) or (exp_ts > 0 and int(time.time()) > exp_ts):
                     break
                 try:
                     await asyncio.wait_for(ws.send(json.dumps(frame, ensure_ascii=False)), timeout=8.0)
@@ -1325,7 +1449,7 @@ class WebPwaServer:
                 async with self._screen_lock:
                     has_subs = bool(self._screen_subs)
                     interval = self._screen_interval
-                if not has_subs:
+                if not has_subs or not self.remote_desktop_enabled:
                     break
 
                 try:
@@ -1339,11 +1463,13 @@ class WebPwaServer:
                         "ts": int(time.time() * 1000),
                         "cursor": cur_info,
                     }
+                    now_unix = int(time.time())
                     async with self._screen_lock:
                         subs = list(self._screen_subs.items())
                     for ws_cli, q in subs:
                         ep = self._client_epochs.get(ws_cli, 0)
-                        if not self.auth.is_epoch_active(ep):
+                        exp_ts = self._client_expiries.get(ws_cli, 0)
+                        if not self.auth.is_epoch_active(ep) or (exp_ts > 0 and now_unix > exp_ts):
                             continue
                         if q.full():
                             try:
@@ -1424,15 +1550,26 @@ class WebPwaServer:
                 return
 
         conn_epoch = 0
+        session_exp_ts = 0
         ok_auth = False
         if q_pair:
-            ok_pair, _sess_tok, ep = self.auth.exchange_pairing_code(q_pair, ip)
+            ok_pair, sess_tok, ep = self.auth.exchange_pairing_code(q_pair, ip)
             if ok_pair:
                 ok_auth = True
                 conn_epoch = ep
+                _, _, session_exp_ts = self.auth.verify_credential_with_expiry(sess_tok, ip, record_failure=False)
         else:
             tok = q_tok or cred
-            ok_auth, conn_epoch = self.auth.verify_credential(tok, ip, record_failure=True)
+            bearer_hdr = (
+                req is not None
+                and (req.headers.get("Authorization") or "").strip().lower().startswith("bearer ")
+            )
+            ok_auth, conn_epoch, session_exp_ts = self.auth.verify_credential_with_expiry(
+                tok,
+                ip,
+                allow_master=bool(q_tok or bearer_hdr),
+                record_failure=True,
+            )
 
         if not ok_auth or not self.auth.is_epoch_active(conn_epoch):
             logger.warning("Rejected unauthorized Stayy WS connection from %s", ip)
@@ -1447,11 +1584,19 @@ class WebPwaServer:
 
         # CRITICAL RACE CLOSURE: re-check active epoch inside _clients_lock right before registering `ws`!
         async with self._clients_lock:
-            if not self.auth.is_epoch_active(conn_epoch):
+            if not self.auth.is_epoch_active(conn_epoch) or (session_exp_ts > 0 and int(time.time()) > session_exp_ts):
                 await ws.close(code=4001, reason="Revoked")
                 return
             self._clients.add(ws)
             self._client_epochs[ws] = conn_epoch
+            self._client_expiries[ws] = session_exp_ts
+
+        def _is_ws_valid() -> bool:
+            if not self.auth.is_epoch_active(conn_epoch):
+                return False
+            if session_exp_ts > 0 and int(time.time()) > session_exp_ts:
+                return False
+            return True
 
         uploads: dict[str, _UploadState] = {}
         ws_tasks: set[asyncio.Task[None]] = set()
@@ -1552,7 +1697,29 @@ class WebPwaServer:
                 finally:
                     upload_q.task_done()
 
+        async def _deny_capability(cap: str, text: str) -> None:
+            await self._safe_send(
+                ws,
+                {
+                    "type": "capability_disabled",
+                    "capability": cap,
+                    "message": text,
+                },
+            )
+            await self._safe_send(
+                ws,
+                {
+                    "type": "toast",
+                    "level": "err",
+                    "code": "capabilities_denied",
+                    "text": text,
+                },
+            )
+
         async def _run_desktop_frame() -> None:
+            if not self._build_capabilities()["remote_desktop"]["enabled"]:
+                await _deny_capability("remote_desktop", "当前主机未启用远程桌面抓取")
+                return
             try:
                 shot, cur_info = await asyncio.gather(
                     asyncio.to_thread(self._screen_capturer, PROJECT_INBOX_DIR, 1440, 80),
@@ -1620,6 +1787,9 @@ class WebPwaServer:
             )
 
         async def _run_desktop_input(dmsg: dict[str, Any]) -> None:
+            if not self._build_capabilities()["remote_desktop"]["enabled"]:
+                await _deny_capability("remote_desktop", "当前主机未启用远程桌面触控")
+                return
             async with desk_input_lock:
                 act_kind = str(dmsg.get("action") or "")
                 kname = str(dmsg.get("key") or "")
@@ -1631,16 +1801,20 @@ class WebPwaServer:
                     await self._safe_send(ws, {"type": "toast", "level": "err", "text": "触控坐标参数无效"})
                     return
 
-                if not self.auth.is_epoch_active(conn_epoch):
+                if not _is_ws_valid():
                     try:
                         await ws.close(code=4001, reason="Revoked")
                     except Exception:
                         pass
                     return
 
+                if not self._build_capabilities()["remote_desktop"]["enabled"]:
+                    await _deny_capability("remote_desktop", "当前主机未启用远程桌面触控")
+                    return
+
                 def _invoke_desk_handler() -> tuple[bool, str]:
-                    if not self.auth.is_epoch_active(conn_epoch):
-                        return (False, "配对已撤销，动作已取消")
+                    if not _is_ws_valid() or not self._build_capabilities()["remote_desktop"]["enabled"]:
+                        return (False, "会话已失效或远程桌面已关闭，动作已取消")
                     try:
                         return self._desktop_input_handler(act_kind, xr, yr, kname, txt_payload)
                     except TypeError:
@@ -1652,7 +1826,7 @@ class WebPwaServer:
                     await self._safe_send(ws, {"type": "toast", "level": "info" if ok else "err", "text": note})
                 async with self._screen_lock:
                     has_live = ws in self._screen_subs
-                if ok and not has_live:
+                if ok and not has_live and self._build_capabilities()["remote_desktop"]["enabled"]:
                     await asyncio.sleep(0.06 if act_kind == "move" else 0.16)
                     try:
                         shot, cur_info = await asyncio.gather(
@@ -1673,17 +1847,27 @@ class WebPwaServer:
 
         async def _run_pc_system_inspect() -> None:
             session_cur = self._session_for_slot(self._active_slot)
-            sys_info, clip_info = await asyncio.gather(
-                asyncio.to_thread(self._pc_system_inspector, session_cur.workspace),
-                asyncio.to_thread(self._pc_clipboard_getter),
-            )
+            if self.remote_clipboard_enabled:
+                sys_info, clip_info = await asyncio.gather(
+                    asyncio.to_thread(self._pc_system_inspector, session_cur.workspace),
+                    asyncio.to_thread(self._pc_clipboard_getter),
+                )
+            else:
+                sys_info = await asyncio.to_thread(self._pc_system_inspector, session_cur.workspace)
+                clip_info = {"ok": False, "disabled": True, "text": "", "truncated": False, "length": 0}
             await self._safe_send(ws, {"type": "pc_system_state", "system": sys_info, "clipboard": clip_info})
 
         async def _run_pc_clipboard_get() -> None:
+            if not self.remote_clipboard_enabled:
+                await _deny_capability("remote_clipboard", "远程剪贴板默认关闭，请在电脑端启动器开启")
+                return
             clip_info = await asyncio.to_thread(self._pc_clipboard_getter)
             await self._safe_send(ws, {"type": "pc_clipboard", **clip_info})
 
         async def _run_pc_clipboard_set(txt_clip: str) -> None:
+            if not self.remote_clipboard_enabled:
+                await _deny_capability("remote_clipboard", "远程剪贴板默认关闭，请在电脑端启动器开启")
+                return
             ok, note = await asyncio.to_thread(self._pc_clipboard_setter, txt_clip)
             await self._safe_send(ws, {"type": "toast", "level": "info" if ok else "err", "text": note})
 
@@ -1761,8 +1945,8 @@ class WebPwaServer:
             )
 
             async for raw in ws:
-                if not self.auth.is_epoch_active(conn_epoch):
-                    await ws.close(code=4001, reason="Revoked")
+                if not _is_ws_valid():
+                    await ws.close(code=4001, reason="Session expired or revoked")
                     break
                 if not isinstance(raw, str):
                     continue
@@ -1773,8 +1957,8 @@ class WebPwaServer:
                 if not isinstance(msg, dict):
                     continue
 
-                if not self.auth.is_epoch_active(conn_epoch):
-                    await ws.close(code=4001, reason="Revoked")
+                if not _is_ws_valid():
+                    await ws.close(code=4001, reason="Session expired or revoked")
                     break
 
                 mtype = msg.get("type")
@@ -1784,21 +1968,15 @@ class WebPwaServer:
 
                 elif mtype == "desktop_frame":
                     if not self._build_capabilities()["remote_desktop"]["enabled"]:
-                        await self._safe_send(
-                            ws,
-                            {"type": "toast", "level": "err", "text": "当前主机不支持远程桌面抓取", "code": "capabilities_denied"},
-                        )
+                        await _deny_capability("remote_desktop", "当前主机未启用远程桌面抓取")
                         continue
                     _spawn_ws_task(_run_desktop_frame(), coalesce_key="desktop_frame")
 
-                elif mtype == "live_screen":
-                    enable = bool(msg.get("enable"))
+                elif mtype in {"live_screen", "desktop_screen_start"}:
+                    enable = True if mtype == "desktop_screen_start" else bool(msg.get("enable"))
                     if enable:
                         if not self._build_capabilities()["remote_desktop"]["enabled"]:
-                            await self._safe_send(
-                                ws,
-                                {"type": "toast", "level": "err", "text": "当前主机未启用远程桌面画面流", "code": "capabilities_denied"},
-                            )
+                            await _deny_capability("remote_desktop", "当前主机未启用远程桌面画面流")
                             continue
                         interval = self._safe_float_param(
                             msg.get("interval_ms"), 750.0, min_val=600.0, max_val=5000.0
@@ -1882,10 +2060,7 @@ class WebPwaServer:
 
                 elif mtype == "desktop_input":
                     if not self._build_capabilities()["remote_desktop"]["enabled"]:
-                        await self._safe_send(
-                            ws,
-                            {"type": "toast", "level": "err", "text": "当前主机未启用远程桌面输入", "code": "capabilities_denied"},
-                        )
+                        await _deny_capability("remote_desktop", "当前主机未启用远程桌面触控")
                         continue
                     _spawn_ws_task(_run_desktop_input(msg))
 
@@ -1893,9 +2068,15 @@ class WebPwaServer:
                     _spawn_ws_task(_run_pc_system_inspect(), coalesce_key="pc_system_inspect")
 
                 elif mtype == "pc_clipboard_get":
+                    if not self.remote_clipboard_enabled:
+                        await _deny_capability("remote_clipboard", "远程剪贴板默认关闭，请在电脑端启动器开启")
+                        continue
                     _spawn_ws_task(_run_pc_clipboard_get())
 
                 elif mtype == "pc_clipboard_set":
+                    if not self.remote_clipboard_enabled:
+                        await _deny_capability("remote_clipboard", "远程剪贴板默认关闭，请在电脑端启动器开启")
+                        continue
                     _spawn_ws_task(_run_pc_clipboard_set(str(msg.get("text") or "")))
 
                 elif mtype == "agents_refresh":
@@ -1925,6 +2106,7 @@ class WebPwaServer:
             async with self._clients_lock:
                 self._clients.discard(ws)
                 self._client_epochs.pop(ws, None)
+                self._client_expiries.pop(ws, None)
             logger.info("Stayy 客户端已断开 (%s)", ip)
 
     def _safe_file_size(self, path: Path) -> int:
@@ -2580,6 +2762,8 @@ class WebPwaServer:
         on_reset: Callable[[], Any],
         on_tool: Callable[[str], Any],
         on_status: Callable[[str], Any],
+        on_delivered: Callable[[str], Any] | None = None,
+        on_delivery_failed: Callable[[str], Any] | None = None,
         already_delivered: bool = False,
         preset_baseline_lines: int | None = None,
     ) -> tuple[TurnResult, list[Path]] | None:
@@ -2603,6 +2787,8 @@ class WebPwaServer:
             delivered, note = await asyncio.to_thread(self._pc_window_sender, ide_cid, title, prompt_text)
             if not delivered:
                 logger.warning("PC IDE window delivery rejected (%s): %s", ide_cid[:8], note)
+                if on_delivery_failed is not None:
+                    await on_delivery_failed("✗ 电脑窗口投递失败")
                 return (
                     TurnResult(
                         status="ERROR",
@@ -2613,6 +2799,9 @@ class WebPwaServer:
                     ),
                     [],
                 )
+
+        if on_delivered is not None:
+            await on_delivered("✓ 已投递至电脑窗口")
 
         await on_status(
             "⚡ 已送达引导指令，等待当前步骤衔接..." if was_pc_running else "电脑端窗口已接收，正在执行..."
@@ -2645,6 +2834,8 @@ class WebPwaServer:
         on_reset: Callable[[], Any],
         on_tool: Callable[[str], Any],
         on_status: Callable[[str], Any],
+        on_delivered: Callable[[str], Any] | None = None,
+        on_delivery_failed: Callable[[str], Any] | None = None,
     ) -> tuple[TurnResult, list[Path]] | None:
         """Create a brand-new conversation inside the open PC Antigravity window and stream its reply."""
         if self._pc_window_new_sender is None:
@@ -2656,6 +2847,8 @@ class WebPwaServer:
             logger.warning("PC IDE new-chat creation failed: %s", note)
             if slot_store_req := (self._slot_meta.get(chat_slot, {}).get("store") or ""):
                 if slot_store_req == "ide":
+                    if on_delivery_failed is not None:
+                        await on_delivery_failed("✗ 未能在电脑端新建并投递")
                     return (
                         TurnResult(
                             status="ERROR",
@@ -2691,6 +2884,9 @@ class WebPwaServer:
                 }
             )
 
+        if on_delivered is not None:
+            await on_delivered("✓ 已在电脑端新建并投递")
+
         await on_status("电脑端新对话已创建，正在执行...")
         ide_root = self.ide_store_dir if self.ide_store_dir is not None else _default_ide_dir()
         empty_snap = {
@@ -2724,6 +2920,7 @@ class WebPwaServer:
         on_delta: Callable[[str], Any],
         on_tool: Callable[[str], Any],
         on_status: Callable[[str], Any],
+        on_started: Callable[[str], Any] | None = None,
     ) -> TurnResult | None:
         """Start a new (`codex_cid == ""`) or resume an existing OpenAI Codex PC thread via `codex.exe exec`."""
         codex_exe = self._codex_cli_override
@@ -2807,6 +3004,8 @@ class WebPwaServer:
                     timeout=max(1.0, overall_deadline - time.monotonic()),
                 )
                 proc.stdin.close()
+            if on_started is not None:
+                await on_started("▶ 已启动电脑 Codex 执行")
 
             assert proc.stdout is not None
             while True:
@@ -2943,11 +3142,15 @@ class WebPwaServer:
         on_reset: Callable[[], Any],
         on_tool: Callable[[str], Any],
         on_status: Callable[[str], Any],
+        on_started: Callable[[str], Any] | None = None,
+        on_delivery_failed: Callable[[str], Any] | None = None,
     ) -> TurnResult | None:
         spec = self.agent_registry.get_agent(store)
         if spec is None or spec.kind not in {"native_cli", "openai_api"}:
             return None
         if not spec.configured:
+            if on_delivery_failed is not None:
+                await on_delivery_failed(f"✗ {spec.name} 尚未配置或未就绪")
             return TurnResult(
                 response="",
                 status="ERROR",
@@ -2962,6 +3165,8 @@ class WebPwaServer:
             if not self.auth.is_epoch_active(conn_epoch):
                 return TurnResult(response="", status="CANCELLED", error="配对已撤销", conversation_id=conv_id, active_model=spec.name)
             if conv_id and comp_key in self._inflight_comp_keys:
+                if on_delivery_failed is not None:
+                    await on_delivery_failed(f"✗ {spec.name} 会话忙")
                 return TurnResult(response="", status="ERROR", error=f"该 {spec.name} 会话正在另一路执行中，请稍候再试", conversation_id=conv_id, active_model=spec.name)
             if conv_id:
                 self._inflight_comp_keys.add(comp_key)
@@ -2969,7 +3174,14 @@ class WebPwaServer:
 
         discovered_sid = conv_id
         had_text = {"v": False}
+        started_sent = {"v": False}
         thought_state: dict[str, Any] = {"last_emit": 0.0, "buf": []}
+
+        async def _emit_started() -> None:
+            if not started_sent["v"]:
+                started_sent["v"] = True
+                if on_started is not None:
+                    await on_started(f"▶ 已交由 {spec.name} 处理")
 
         async def _cb_session(new_sid: str) -> None:
             nonlocal discovered_sid
@@ -2978,12 +3190,14 @@ class WebPwaServer:
 
         async def _cb_delta(d: str) -> None:
             had_text["v"] = True
+            await _emit_started()
             await on_delta(d)
 
         async def _cb_thought(chunk: str) -> None:
             txt = (chunk or "").strip()
             if not txt:
                 return
+            await _emit_started()
             thought_state["buf"].append(txt)
             now_t = time.monotonic()
             if thought_state["last_emit"] == 0.0 or (now_t - thought_state["last_emit"]) >= 1.2:
@@ -2996,6 +3210,7 @@ class WebPwaServer:
                 await on_status(f"{spec.name} 深度思考中：{snippet}")
 
         async def _cb_tool(tname: str, detail: str) -> None:
+            await _emit_started()
             await on_status(f"{spec.name} 正在调用 {tname}...")
             await on_tool(tname)
 
@@ -3009,6 +3224,7 @@ class WebPwaServer:
                 self._active_agent_procs[chat_slot] = p
                 if not self.auth.is_epoch_active(conn_epoch):
                     cancel_ev.set()
+            await _emit_started()
 
         async def _cb_proc_done(_p: asyncio.subprocess.Process) -> None:
             with self._revoke_exec_lock:
@@ -3060,7 +3276,10 @@ class WebPwaServer:
             if res.aborted:
                 return TurnResult(status="CANCELLED", response=res.text, error=res.error, conversation_id=final_sid, active_model=spec.name)
             if not res.ok:
+                if not started_sent["v"] and on_delivery_failed is not None:
+                    await on_delivery_failed(f"✗ {spec.name} 启动或请求失败")
                 return TurnResult(status="ERROR", response=res.text, error=res.error, conversation_id=final_sid, active_model=spec.name)
+            await _emit_started()
             return TurnResult(status="SUCCESS", response=res.text, conversation_id=final_sid, active_model=spec.name)
         finally:
             with self._revoke_exec_lock:
@@ -3163,7 +3382,7 @@ class WebPwaServer:
         if not prompt_text:
             return
 
-        already_delivered_pc = False
+        delivered_client_id: str | None = None
         preset_baseline: int | None = None
         already_persisted_user = False
 
@@ -3223,8 +3442,8 @@ class WebPwaServer:
                             "type": "chat_ack",
                             "client_id": client_id,
                             "slot": chat_slot,
-                            "stage": "steer_failed",
-                            "label": "⚠ 未送达电脑窗口（可点重填）",
+                            "stage": "delivery_failed",
+                            "label": "✗ 引导指令未送达电脑窗口（可点重填）",
                         }
                     )
                     await self._safe_send(
@@ -3259,7 +3478,7 @@ class WebPwaServer:
 
                 # Previous turn finished right while we were pasting `prompt_text` into IDE -> seamlessly track the new turn!
                 if chat_slot not in self._slot_inflight and self.auth.is_epoch_active(turn_epoch):
-                    already_delivered_pc = True
+                    delivered_client_id = client_id
                     already_persisted_user = True
                     preset_baseline = int(pre_snap_st.get("total_lines") or 0)
                 else:
@@ -3407,27 +3626,33 @@ class WebPwaServer:
                     hint = "电脑端正在检索与处理..."
                 await _on_status(hint)
 
+            emitted_ack_stages: set[str] = set()
+
+            async def _emit_chat_ack(stage: str, label: str, *, inf_obj: dict[str, Any] = inflight_state) -> None:
+                if not _owns_turn(inf_obj):
+                    return
+                if stage in emitted_ack_stages:
+                    return
+                if stage == "delivery_failed" and (
+                    "delivered_pc" in emitted_ack_stages or "started_cli" in emitted_ack_stages
+                ):
+                    return
+                emitted_ack_stages.add(stage)
+                await self._broadcast(
+                    {
+                        "type": "chat_ack",
+                        "client_id": client_id,
+                        "slot": chat_slot,
+                        "stage": stage,
+                        "label": label,
+                    }
+                )
+
             try:
                 if not already_persisted_user:
-                    await self._broadcast(
-                        {
-                            "type": "chat_ack",
-                            "client_id": client_id,
-                            "slot": chat_slot,
-                            "stage": "gateway_accepted",
-                            "label": "✓ 网关已接收",
-                        }
-                    )
+                    await _emit_chat_ack("gateway_accepted", "✓ 网关已接收")
                 else:
-                    await self._broadcast(
-                        {
-                            "type": "chat_ack",
-                            "client_id": client_id,
-                            "slot": chat_slot,
-                            "stage": "processing_followup",
-                            "label": "⚡ 正在自动执行此引导指令",
-                        }
-                    )
+                    await _emit_chat_ack("processing_followup", "⚡ 正在自动执行此引导指令")
                 if self._active_slot == chat_slot:
                     if not already_persisted_user and not (raw_text.startswith("/") and not attachments):
                         await self._broadcast({"type": "user_msg", "slot": chat_slot, "item": user_entry})
@@ -3457,21 +3682,14 @@ class WebPwaServer:
                         on_reset=_on_reset,
                         on_tool=_on_tool,
                         on_status=_on_status,
-                        already_delivered=already_delivered_pc,
+                        on_delivered=lambda lbl: _emit_chat_ack("delivered_pc", lbl),
+                        on_delivery_failed=lambda lbl: _emit_chat_ack("delivery_failed", lbl),
+                        already_delivered=(delivered_client_id == client_id),
                         preset_baseline_lines=preset_baseline,
                     )
                     if pc_ide_out is not None:
                         result, extra_pc_images = pc_ide_out
                         pc_direct_persisted = True
-                        await self._broadcast(
-                            {
-                                "type": "chat_ack",
-                                "client_id": client_id,
-                                "slot": chat_slot,
-                                "stage": "delivered_pc",
-                                "label": "✓ 已投递至电脑窗口",
-                            }
-                        )
 
                 # 2. Brand-new PC Antigravity IDE conversation (tapped `+` or sent from default home screen)
                 elif not slot_cid and slot_store in {"", "ide"} and self._pc_window_new_sender is not None:
@@ -3487,19 +3705,12 @@ class WebPwaServer:
                         on_reset=_on_reset,
                         on_tool=_on_tool,
                         on_status=_on_status,
+                        on_delivered=lambda lbl: _emit_chat_ack("delivered_pc", lbl),
+                        on_delivery_failed=lambda lbl: _emit_chat_ack("delivery_failed", lbl),
                     )
                     if pc_new_out is not None:
                         result, extra_pc_images = pc_new_out
                         pc_direct_persisted = True
-                        await self._broadcast(
-                            {
-                                "type": "chat_ack",
-                                "client_id": client_id,
-                                "slot": chat_slot,
-                                "stage": "delivered_pc",
-                                "label": "✓ 已在电脑端新建并投递",
-                            }
-                        )
 
                 # 3. Existing OR brand-new PC OpenAI Codex conversation (`slot_store == "codex"`)
                 elif slot_store == "codex":
@@ -3512,19 +3723,11 @@ class WebPwaServer:
                         on_delta=_on_delta,
                         on_tool=_on_tool,
                         on_status=_on_status,
+                        on_started=lambda lbl: _emit_chat_ack("started_cli", lbl),
                     )
                     if cdx_out is not None:
                         result = cdx_out
                         pc_direct_persisted = True
-                        await self._broadcast(
-                            {
-                                "type": "chat_ack",
-                                "client_id": client_id,
-                                "slot": chat_slot,
-                                "stage": "delivered_pc",
-                                "label": "✓ 已交由电脑 Codex 执行",
-                            }
-                        )
                         if not slot_cid and cdx_out.conversation_id:
                             new_title = raw_text[:38] or "Codex 新对话"
                             meta_cur = self._slot_meta.setdefault(chat_slot, {})
@@ -3562,8 +3765,11 @@ class WebPwaServer:
                         on_reset=_on_reset,
                         on_tool=_on_tool,
                         on_status=_on_status,
+                        on_started=lambda lbl: _emit_chat_ack("started_cli", lbl),
+                        on_delivery_failed=lambda lbl: _emit_chat_ack("delivery_failed", lbl),
                     )
                     if eco_out is None:
+                        await _emit_chat_ack("delivery_failed", f"✗ 未找到 AI 代理：{slot_store}")
                         result = TurnResult(
                             response="",
                             status="ERROR",
@@ -3574,15 +3780,6 @@ class WebPwaServer:
                     else:
                         result = eco_out
                         pc_direct_persisted = slot_store not in {"dsh", "copilot"}
-                        await self._broadcast(
-                            {
-                                "type": "chat_ack",
-                                "client_id": client_id,
-                                "slot": chat_slot,
-                                "stage": "delivered_pc",
-                                "label": f"✓ 已交由 {eco_out.active_model or slot_store} 处理",
-                            }
-                        )
                         if eco_out.conversation_id and (not slot_cid or slot_cid != eco_out.conversation_id):
                             ag_label = eco_out.active_model or slot_store
                             new_title = raw_text[:38] or f"{ag_label} 对话"
@@ -3619,6 +3816,7 @@ class WebPwaServer:
                     else:
                         if slot_store in {"ide", "codex"} and (self._pc_window_sender is not None or slot_store == "codex"):
                             await _on_status("桌面窗口未就绪，已切换后台引擎接力处理...")
+                        await _emit_chat_ack("started_cli", "▶ 已启动后台引擎执行")
                         result = await session.ask(
                             prompt_text,
                             on_delay_notice=None,
@@ -3800,7 +3998,7 @@ class WebPwaServer:
                     user_entry = nxt["user_entry"]
                     client_id = str(nxt["client_id"])
                     already_persisted_user = True
-                    already_delivered_pc = False
+                    delivered_client_id = None
                     preset_baseline = None
                     was_brand_new = False
                     handed_off_next = True
@@ -4176,8 +4374,9 @@ class WebPwaServer:
                 writer.write(hdr + body)
                 await writer.drain()
                 return
+            raw_body = b""
             if clen > 0:
-                await asyncio.wait_for(reader.readexactly(clen), timeout=4.0)
+                raw_body = await asyncio.wait_for(reader.readexactly(clen), timeout=4.0)
 
             provided = hdrs.get("x-admin-token", "")
             if not provided or not hmac.compare_digest(provided, self.admin_secret):
@@ -4191,10 +4390,23 @@ class WebPwaServer:
                     "host_id": self.auth.host_id,
                     "auth_epoch": self.auth.current_epoch(),
                     "clients": n_cli,
+                    "capabilities": self._build_capabilities(),
                 }
             elif method == "POST" and raw_path == "/admin/pair":
                 code = self.auth.issue_pairing_code(ttl_sec=300.0)
                 status, reason, payload = 200, "OK", {"ok": True, "code": code, "ttl_sec": 300}
+            elif method == "POST" and raw_path == "/admin/capabilities":
+                try:
+                    req_obj = json.loads(raw_body.decode("utf-8")) if raw_body else {}
+                except Exception:
+                    req_obj = {}
+                if not isinstance(req_obj, dict):
+                    req_obj = {}
+                caps = await self.set_remote_capabilities(
+                    remote_desktop=(bool(req_obj["remote_desktop"]) if "remote_desktop" in req_obj else None),
+                    remote_clipboard=(bool(req_obj["remote_clipboard"]) if "remote_clipboard" in req_obj else None),
+                )
+                status, reason, payload = 200, "OK", {"ok": True, "capabilities": caps}
             elif method == "POST" and raw_path == "/admin/revoke":
                 ok_rev, closed_cnt, new_ep = await self.revoke_all_tokens()
                 if ok_rev:
@@ -4244,7 +4456,7 @@ class WebPwaServer:
             self._tasks.add(pw_task)
             pw_task.add_done_callback(self._tasks.discard)
 
-        for coro in (self._ide_watch_loop(), self._cache_clean_loop()):
+        for coro in (self._ide_watch_loop(), self._cache_clean_loop(), self._session_expiry_sweep_loop()):
             bg_task = asyncio.create_task(coro)
             self._tasks.add(bg_task)
             bg_task.add_done_callback(self._tasks.discard)

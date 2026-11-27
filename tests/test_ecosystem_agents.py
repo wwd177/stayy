@@ -924,7 +924,7 @@ def test_e2_desktop_app_pe_guards_junction_drift_and_uac(tmp_path: Path, monkeyp
 
 @pytest.mark.asyncio
 async def test_e3_ws_desktop_app_launch_blocked_after_revoke(tmp_path: Path) -> None:
-    cfg = _make_config(tmp_path)
+    cfg = _make_config(tmp_path, remote_desktop_enabled=True)
     sessions = SessionManager(cfg, command_override=[sys.executable, str(MOCK_AGY)])
     pwa = WebPwaServer(
         cfg,

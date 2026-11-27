@@ -85,6 +85,8 @@ class BridgeConfig:
     web_pwa_port: int = 8766
     web_access_token: str = ""
     # Stayy security, multi-user beacon isolation, proxy trust & notification config
+    remote_desktop_enabled: bool = False
+    remote_clipboard_enabled: bool = False
     beacon_enabled: bool = False
     beacon_git_remote: str = ""
     beacon_branch: str = "gh-pages"
@@ -213,6 +215,8 @@ class BridgeConfig:
             web_pwa_host=(_get("WEB_PWA_HOST") or "0.0.0.0").strip(),
             web_pwa_port=_parse_int(_get("WEB_PWA_PORT"), 8766),
             web_access_token=(_get("WEB_ACCESS_TOKEN") or "").strip(),
+            remote_desktop_enabled=_parse_bool(_get("REMOTE_DESKTOP_ENABLED"), False),
+            remote_clipboard_enabled=_parse_bool(_get("REMOTE_CLIPBOARD_ENABLED"), False),
             beacon_enabled=_parse_bool(_get("BEACON_ENABLED"), False),
             beacon_git_remote=(_get("BEACON_GIT_REMOTE") or "").strip(),
             beacon_branch=(_get("BEACON_BRANCH") or "gh-pages").strip() or "gh-pages",
