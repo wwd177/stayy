@@ -551,6 +551,7 @@ def publish_ios_pwa_and_beacon(
     beacon_enabled: bool,
     explicit_remote: str,
     beacon_branch: str = "gh-pages",
+    allow_upstream_protected: bool = False,
     verify_live: bool = True,
     runtime_dir: Path | None = None,
     out_meta: dict[str, Any] | None = None,
@@ -566,6 +567,7 @@ def publish_ios_pwa_and_beacon(
         project_dir,
         beacon_enabled=beacon_enabled,
         explicit_remote=explicit_remote,
+        allow_upstream_protected=allow_upstream_protected,
     )
     if gh_info is None:
         return (False, "disabled", "未显式启用用户自建 GitHub Pages 信标（BEACON_ENABLED=false）")
@@ -646,6 +648,7 @@ def publish_ios_pwa_and_beacon(
                 stage_dir,
                 beacon_enabled=True,
                 explicit_remote="_beacon_target",
+                allow_upstream_protected=allow_upstream_protected,
             )
             if (
                 re_checked is None

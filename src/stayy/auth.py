@@ -269,6 +269,18 @@ class AuthManager:
             self._pairing_codes[code] = now + max(15.0, float(ttl_sec))
         return code
 
+    def is_pairing_code_valid(self, code: str) -> bool:
+        """Check non-destructively whether `code` is still active and unconsumed."""
+        cand = (code or "").strip()
+        if not cand:
+            return False
+        now = time.monotonic()
+        with self._lock:
+            expired = [k for k, exp in self._pairing_codes.items() if exp <= now]
+            for k in expired:
+                self._pairing_codes.pop(k, None)
+            return any(self._ct_eq(cand, k) for k in self._pairing_codes)
+
     def _sign_token(self, prefix: str, subject: str, epoch: int, ttl_sec: float) -> str:
         exp = int(time.time()) + max(15, int(ttl_sec))
         nonce = secrets.token_urlsafe(10)

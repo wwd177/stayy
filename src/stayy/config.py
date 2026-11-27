@@ -90,6 +90,7 @@ class BridgeConfig:
     beacon_enabled: bool = False
     beacon_git_remote: str = ""
     beacon_branch: str = "gh-pages"
+    beacon_allow_upstream: bool = False
     public_base_url: str = ""
     allowed_origins: tuple[str, ...] = ()
     trust_cf_proxy_headers: bool = False
@@ -220,6 +221,7 @@ class BridgeConfig:
             beacon_enabled=_parse_bool(_get("BEACON_ENABLED"), False),
             beacon_git_remote=(_get("BEACON_GIT_REMOTE") or "").strip(),
             beacon_branch=(_get("BEACON_BRANCH") or "gh-pages").strip() or "gh-pages",
+            beacon_allow_upstream=_parse_bool(_get("BEACON_ALLOW_UPSTREAM"), False),
             public_base_url=(_get("PUBLIC_BASE_URL") or "").strip().rstrip("/"),
             allowed_origins=_parse_csv(_get("ALLOWED_ORIGINS")),
             trust_cf_proxy_headers=_parse_bool(_get("TRUST_CF_PROXY_HEADERS"), False),

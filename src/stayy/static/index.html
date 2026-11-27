@@ -6202,8 +6202,12 @@
           $('authModal').classList.remove('show');
           reconnectAttempt = 0;
           connect();
+        } else if (res.status === 401) {
+          showTokenLoginModal('配对码无效或已过期，请回到电脑端点击「刷码」或改用访问密钥登录：');
+        } else if (res.status === 403) {
+          showTokenLoginModal('安全来源校验未通过 (403)，请直接在扫码页面操作或改用访问密钥登录：');
         } else {
-          showTokenLoginModal('配对码无效或已过期，请回到电脑端刷新二维码，或改用访问密钥登录：');
+          showTokenLoginModal(`网关或隧道响应异常 (HTTP ${res.status})，请重试或改用访问密钥登录：`);
         }
       } catch (_) {
         showTokenLoginModal('配对请求失败，请检查网络或改用访问密钥登录：');
@@ -6229,7 +6233,13 @@
           headers: { 'Authorization': `Bearer ${v}` },
         });
         if (!res.ok) {
-          if ($('authModalDesc')) $('authModalDesc').textContent = '访问密钥无效或请求过于频繁，请核对 .env 中的 WEB_ACCESS_TOKEN：';
+          if ($('authModalDesc')) {
+            $('authModalDesc').textContent = res.status === 401
+              ? '访问密钥无效或请求过于频繁，请核对 .env 中的 WEB_ACCESS_TOKEN：'
+              : (res.status === 403
+                ? '安全来源校验未通过 (403)，请刷新页面后重试：'
+                : `网关或隧道响应异常 (HTTP ${res.status})，请稍后重试：`);
+          }
           return;
         }
         $('tokenInput').value = '';

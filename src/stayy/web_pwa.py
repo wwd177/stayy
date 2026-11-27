@@ -49,6 +49,7 @@ from .auth import (
     cleanup_admin_state,
     write_admin_state,
 )
+from .beacon import resolve_explicit_beacon_target
 from .config import BridgeConfig, resolve_agy_executable
 from .conversations import (
     SAVED_PATH_RE,
@@ -471,6 +472,244 @@ class _UploadState:
             pass
 
 
+_MAX_POST_HEAD_BYTES = 16384
+_MAX_POST_BODY_BYTES = 4096
+_HTTP_POST_HEADER_TOKEN_RE = re.compile(rb"^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$")
+_ALLOWED_POST_COMPAT_PATHS = frozenset({"/api/pair", "/api/auth/login"})
+
+
+def _consume_chunked_post_body(buf: bytes) -> tuple[str, str]:
+    """Validate and consume HTTP/1.1 chunked framing up to `_MAX_POST_BODY_BYTES`.
+
+    Returns `('complete' | 'need_more' | 'bad_request' | 'too_large', reason)`.
+    """
+    pos = 0
+    total_data = 0
+    buf_len = len(buf)
+    while True:
+        line_end = buf.find(b"\r\n", pos)
+        if line_end < 0:
+            if (buf_len - pos) > 64:
+                return "bad_request", "Chunk size line too long"
+            return "need_more", ""
+        if (line_end - pos) > 64:
+            return "bad_request", "Chunk size line too long"
+        size_part = buf[pos:line_end].split(b";", 1)[0].strip()
+        if not re.fullmatch(rb"[0-9A-Fa-f]{1,8}", size_part):
+            return "bad_request", "Invalid chunk size"
+        chunk_size = int(size_part, 16)
+        if chunk_size > _MAX_POST_BODY_BYTES or (total_data + chunk_size) > _MAX_POST_BODY_BYTES:
+            return "too_large", "Payload too large"
+        data_start = line_end + 2
+        if chunk_size == 0:
+            tr_pos = data_start
+            tr_bytes = 0
+            while True:
+                tr_end = buf.find(b"\r\n", tr_pos)
+                if tr_end < 0:
+                    if (buf_len - tr_pos) + tr_bytes > 2048:
+                        return "bad_request", "Chunk trailer too large"
+                    return "need_more", ""
+                if tr_end == tr_pos:
+                    return "complete", ""
+                tr_line = buf[tr_pos:tr_end]
+                tr_bytes += len(tr_line) + 2
+                if tr_bytes > 2048 or b":" not in tr_line:
+                    return "bad_request", "Invalid chunk trailer"
+                tr_pos = tr_end + 2
+        if buf_len < data_start + chunk_size + 2:
+            if (buf_len - data_start) > chunk_size + 2:
+                return "bad_request", "Malformed chunk body"
+            return "need_more", ""
+        if buf[data_start + chunk_size : data_start + chunk_size + 2] != b"\r\n":
+            return "bad_request", "Missing chunk CRLF"
+        total_data += chunk_size
+        pos = data_start + chunk_size + 2
+
+
+class _HttpPostFriendlyServerConnection(ServerConnection):
+    """Safely unchunk/consume small auth HTTP POST bodies (e.g. from `cloudflared`) before `websockets.Request.parse`.
+
+    `websockets/17.x` raises `NotImplementedError` on `Transfer-Encoding` and `ValueError` on non-zero
+    `Content-Length` before `process_request` runs, causing reverse proxies like Cloudflare Tunnel to return 502.
+    Non-POST traffic and non-auth paths bypass directly to `super().data_received`.
+    """
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._post_mode: str = "init"  # 'init' | 'passthrough' | 'post_body' | 'post_done'
+        self._post_buf = bytearray()
+        self._post_cleaned_head: bytes = b""
+        self._post_body_mode: str = ""  # 'none' | 'chunked' | 'cl'
+        self._post_expected_cl: int = 0
+
+    def _send_early_http_error(self, status: int, reason: str) -> None:
+        self._post_mode = "post_done"
+        self._post_buf.clear()
+        body = json.dumps({"ok": False, "error": reason.lower().replace(" ", "_")}).encode("utf-8")
+        resp = (
+            f"HTTP/1.1 {status} {reason}\r\n"
+            "Content-Type: application/json; charset=utf-8\r\n"
+            f"Content-Length: {len(body)}\r\n"
+            "Cache-Control: no-store\r\n"
+            "Connection: close\r\n\r\n"
+        ).encode("ascii") + body
+        if self.transport is not None:
+            try:
+                self.transport.write(resp)
+            except Exception:
+                pass
+            try:
+                self.transport.close()
+            except Exception:
+                pass
+
+    def _try_complete_post_body(self) -> None:
+        if self._post_body_mode == "none":
+            self._finish_cleaned_post()
+            return
+        raw_body = bytes(self._post_buf)
+        if self._post_body_mode == "cl":
+            if len(raw_body) >= self._post_expected_cl:
+                self._finish_cleaned_post()
+            return
+        if self._post_body_mode == "chunked":
+            state, _reason = _consume_chunked_post_body(raw_body)
+            if state == "complete":
+                self._finish_cleaned_post()
+            elif state == "too_large":
+                self._send_early_http_error(413, "Payload Too Large")
+            elif state == "bad_request":
+                self._send_early_http_error(400, "Bad Request")
+
+    def _finish_cleaned_post(self) -> None:
+        head_bytes = self._post_cleaned_head
+        self._post_cleaned_head = b""
+        self._post_mode = "post_done"
+        self._post_buf.clear()
+        super().data_received(head_bytes)
+
+    def data_received(self, data: bytes) -> None:
+        if self._post_mode == "passthrough":
+            super().data_received(data)
+            return
+        if self._post_mode == "post_done":
+            return
+
+        self._post_buf.extend(data)
+        if self._post_mode == "post_body":
+            if len(self._post_buf) > (_MAX_POST_BODY_BYTES + 2560):
+                self._send_early_http_error(413, "Payload Too Large")
+                return
+            self._try_complete_post_body()
+            return
+
+        # Mode == 'init': inspect initial bytes / HTTP request line & headers
+        buf_bytes = bytes(self._post_buf)
+        if len(buf_bytes) < 5:
+            if not b"POST ".startswith(buf_bytes):
+                self._post_mode = "passthrough"
+                self._post_buf.clear()
+                super().data_received(buf_bytes)
+            return
+        if not buf_bytes.startswith(b"POST "):
+            self._post_mode = "passthrough"
+            self._post_buf.clear()
+            super().data_received(buf_bytes)
+            return
+
+        first_eol = buf_bytes.find(b"\r\n")
+        if first_eol >= 0:
+            req_parts = buf_bytes[:first_eol].split(b" ")
+            req_path = urlsplit(req_parts[1].decode("ascii", "ignore")).path if len(req_parts) >= 2 else ""
+            if req_path not in _ALLOWED_POST_COMPAT_PATHS:
+                self._post_mode = "passthrough"
+                self._post_buf.clear()
+                super().data_received(buf_bytes)
+                return
+        elif len(buf_bytes) > 512:
+            self._post_mode = "passthrough"
+            self._post_buf.clear()
+            super().data_received(buf_bytes)
+            return
+
+        hdr_end = buf_bytes.find(b"\r\n\r\n")
+        if hdr_end < 0:
+            if len(buf_bytes) > _MAX_POST_HEAD_BYTES:
+                self._send_early_http_error(400, "Bad Request")
+            return
+        if hdr_end > _MAX_POST_HEAD_BYTES:
+            self._send_early_http_error(400, "Bad Request")
+            return
+
+        head_block = buf_bytes[:hdr_end]
+        rest = buf_bytes[hdr_end + 4 :]
+        lines = head_block.split(b"\r\n")
+        req_line = lines[0]
+        kept_lines: list[bytes] = []
+        te_vals: list[str] = []
+        cl_vals: list[str] = []
+
+        for hline in lines[1:]:
+            if not hline:
+                continue
+            if hline[:1] in {b" ", b"\t"} or b":" not in hline:
+                self._send_early_http_error(400, "Bad Request")
+                return
+            name_b, _, val_b = hline.partition(b":")
+            if not _HTTP_POST_HEADER_TOKEN_RE.fullmatch(name_b):
+                self._send_early_http_error(400, "Bad Request")
+                return
+            lname = name_b.decode("ascii").lower()
+            val_s = val_b.decode("latin-1").strip()
+            if lname == "transfer-encoding":
+                te_vals.append(val_s)
+                continue
+            if lname == "content-length":
+                cl_vals.append(val_s)
+                continue
+            if lname == "expect":
+                continue
+            kept_lines.append(hline)
+
+        # Strict RFC 9112 / anti-smuggling checks
+        if te_vals and cl_vals:
+            self._send_early_http_error(400, "Bad Request")
+            return
+        if te_vals:
+            codings = [c.strip().lower() for v in te_vals for c in v.split(",") if c.strip()]
+            if codings != ["chunked"]:
+                self._send_early_http_error(400, "Bad Request")
+                return
+            self._post_body_mode = "chunked"
+        elif cl_vals:
+            cl_ints: list[int] = []
+            for cv in cl_vals:
+                if not re.fullmatch(r"[0-9]+", cv):
+                    self._send_early_http_error(400, "Bad Request")
+                    return
+                cl_ints.append(int(cv))
+            if len(set(cl_ints)) != 1:
+                self._send_early_http_error(400, "Bad Request")
+                return
+            cl_num = cl_ints[0]
+            if cl_num > _MAX_POST_BODY_BYTES:
+                self._send_early_http_error(413, "Payload Too Large")
+                return
+            self._post_body_mode = "cl" if cl_num > 0 else "none"
+            self._post_expected_cl = cl_num
+        else:
+            self._post_body_mode = "none"
+
+        self._post_cleaned_head = b"\r\n".join([req_line, *kept_lines, b"Content-Length: 0", b"", b""])
+        self._post_mode = "post_body"
+        self._post_buf = bytearray(rest)
+        if len(self._post_buf) > (_MAX_POST_BODY_BYTES + 2560):
+            self._send_early_http_error(413, "Payload Too Large")
+            return
+        self._try_complete_post_body()
+
+
 class WebPwaServer:
     """Hardened HTTP + WebSocket server + isolated loopback admin control plane for Stayy."""
 
@@ -537,6 +776,18 @@ class WebPwaServer:
             )
         )
         self._ecosystem_project_dir = ecosystem_project_dir or PROJECT_ROOT
+        self._beacon_allowed_origin: str = ""
+        if config.beacon_enabled and config.beacon_git_remote:
+            gh_target = resolve_explicit_beacon_target(
+                self._ecosystem_project_dir,
+                beacon_enabled=True,
+                explicit_remote=config.beacon_git_remote,
+                allow_upstream_protected=config.beacon_allow_upstream,
+            )
+            if gh_target and gh_target[3]:
+                p_gh = urlsplit(gh_target[3])
+                if p_gh.netloc:
+                    self._beacon_allowed_origin = p_gh.netloc.strip().lower()
         self._local_app_data = local_app_data
         self._pc_window_sender: Callable[[str, str, str], tuple[bool, str]] | None = (
             pc_window_sender
@@ -807,6 +1058,8 @@ class WebPwaServer:
             p_pub = urlsplit(self.config.public_base_url)
             if p_pub.netloc:
                 allowed.add(p_pub.netloc.strip().lower())
+        if self._beacon_allowed_origin:
+            allowed.add(self._beacon_allowed_origin)
         return allowed
 
     def _is_allowed_origin(self, origin_hdr: str, host_hdr: str) -> bool:
@@ -835,7 +1088,14 @@ class WebPwaServer:
             if (headers is not None and self.config.trust_cf_proxy_headers)
             else ""
         )
-        return (xf_proto == "https") or self.config.public_base_url.startswith("https://")
+        if (xf_proto == "https") or self.config.public_base_url.startswith("https://"):
+            return True
+        if headers is not None:
+            origin_hdr = (headers.get("Origin") or "").strip()
+            host_hdr = (headers.get("Host") or "").strip()
+            if origin_hdr.lower().startswith("https://") and self._is_allowed_origin(origin_hdr, host_hdr):
+                return True
+        return False
 
     def _session_cookie_header(self, sess_tok: str, headers: Headers | None, *, max_age: int | None = None) -> str:
         is_https = self._is_https_request(headers)
@@ -4384,7 +4644,7 @@ class WebPwaServer:
             elif method == "GET" and raw_path == "/admin/health":
                 async with self._clients_lock:
                     n_cli = len(self._clients)
-                status, reason, payload = 200, "OK", {
+                health_payload: dict[str, Any] = {
                     "ok": True,
                     "service": "stayy",
                     "host_id": self.auth.host_id,
@@ -4392,6 +4652,10 @@ class WebPwaServer:
                     "clients": n_cli,
                     "capabilities": self._build_capabilities(),
                 }
+                chk_pair_code = hdrs.get("x-check-pair-code", "").strip()
+                if chk_pair_code:
+                    health_payload["pair_code_valid"] = self.auth.is_pairing_code_valid(chk_pair_code)
+                status, reason, payload = 200, "OK", health_payload
             elif method == "POST" and raw_path == "/admin/pair":
                 code = self.auth.issue_pairing_code(ttl_sec=300.0)
                 status, reason, payload = 200, "OK", {"ok": True, "code": code, "ttl_sec": 300}
@@ -4467,6 +4731,7 @@ class WebPwaServer:
 
         serve_kwargs: dict[str, Any] = {
             "process_request": self._process_request,
+            "create_connection": _HttpPostFriendlyServerConnection,
             "compression": None,
             "ping_interval": 25,
             "ping_timeout": 45,

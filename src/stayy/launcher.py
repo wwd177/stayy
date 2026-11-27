@@ -351,6 +351,7 @@ class LauncherSettings:
     beacon_branch: str
     public_base_url: str
     project_dir: Path
+    beacon_allow_upstream: bool = False
 
 
 def _bool_env(val: object, default: bool = True) -> bool:
@@ -374,6 +375,7 @@ def load_settings() -> LauncherSettings:
     beacon_enabled = _bool_env(env_data.get("BEACON_ENABLED"), False)
     beacon_git_remote = str(env_data.get("BEACON_GIT_REMOTE") or "").strip()
     beacon_branch = str(env_data.get("BEACON_BRANCH") or "gh-pages").strip() or "gh-pages"
+    beacon_allow_upstream = _bool_env(env_data.get("BEACON_ALLOW_UPSTREAM"), False)
     public_base_url = str(env_data.get("PUBLIC_BASE_URL") or "").strip().rstrip("/")
 
     return LauncherSettings(
@@ -390,6 +392,7 @@ def load_settings() -> LauncherSettings:
         beacon_branch=beacon_branch,
         public_base_url=public_base_url,
         project_dir=PROJECT_DIR,
+        beacon_allow_upstream=beacon_allow_upstream,
     )
 
 
@@ -698,6 +701,7 @@ class LauncherApp:
             settings.project_dir,
             beacon_enabled=settings.beacon_enabled,
             explicit_remote=settings.beacon_git_remote,
+            allow_upstream_protected=settings.beacon_allow_upstream,
         )
         self._ios_pages_url: str = gh_info[3] if gh_info else ""
         self._beacon_synced: bool = False
@@ -1528,12 +1532,16 @@ class LauncherApp:
         path: str,
         timeout: float = 2.0,
         payload: dict[str, Any] | None = None,
+        extra_headers: dict[str, str] | None = None,
     ) -> dict[str, Any] | None:
         st = self._read_admin_state()
         if not st:
             return None
         opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
         headers = {"X-Admin-Token": str(st["admin_token"])}
+        if extra_headers:
+            for k, v in extra_headers.items():
+                headers[k] = str(v)
         body_bytes: bytes | None = None
         if payload is not None:
             body_bytes = json.dumps(payload, ensure_ascii=False).encode("utf-8")
@@ -1633,6 +1641,7 @@ class LauncherApp:
             self.settings.project_dir,
             beacon_enabled=True,
             explicit_remote=raw_rem,
+            allow_upstream_protected=self.settings.beacon_allow_upstream,
         )
         if target:
             _, owner, repo, _ = target
@@ -1648,6 +1657,7 @@ class LauncherApp:
             self.settings.project_dir,
             beacon_enabled=True,
             explicit_remote=cand_rem,
+            allow_upstream_protected=self.settings.beacon_allow_upstream,
         )
         if target is None:
             self._beacon_state = "invalid_remote"
@@ -1685,6 +1695,7 @@ class LauncherApp:
                 beacon_enabled=True,
                 explicit_remote=remote_url,
                 beacon_branch=self.settings.beacon_branch,
+                allow_upstream_protected=self.settings.beacon_allow_upstream,
                 verify_live=True,
                 runtime_dir=RUNTIME_DIR,
                 out_meta=meta,
@@ -1831,6 +1842,7 @@ class LauncherApp:
                     self.settings.project_dir,
                     beacon_enabled=True,
                     explicit_remote=raw_rem,
+                    allow_upstream_protected=self.settings.beacon_allow_upstream,
                 )
                 self._beacon_target_cache[cache_key] = cand
             target_line = (
@@ -2105,15 +2117,26 @@ class LauncherApp:
             return
         gw_ident = probe_stayy_gateway_identity("127.0.0.1", self.settings.web_pwa_port, timeout=0.45)
         pwa_open = gw_ident == "stayy"
-        if pwa_open and (
-            not self._active_pair_code
-            or (time.monotonic() - self._active_pair_issued_mono) >= 240.0
-        ):
-            res = self._admin_request("POST", "/admin/pair")
-            if res and res.get("ok") and res.get("code"):
-                self._active_pair_code = str(res["code"])
-                self._active_pair_issued_mono = time.monotonic()
-                self._post_ui(self._render_inline_qr)
+        if pwa_open:
+            need_pair_refresh = (
+                not self._active_pair_code
+                or (time.monotonic() - self._active_pair_issued_mono) >= 240.0
+            )
+            if not need_pair_refresh:
+                chk = self._admin_request(
+                    "GET",
+                    "/admin/health",
+                    timeout=1.2,
+                    extra_headers={"X-Check-Pair-Code": self._active_pair_code},
+                )
+                if chk and chk.get("ok") and chk.get("pair_code_valid") is False:
+                    need_pair_refresh = True
+            if need_pair_refresh:
+                res = self._admin_request("POST", "/admin/pair")
+                if res and res.get("ok") and res.get("code"):
+                    self._active_pair_code = str(res["code"])
+                    self._active_pair_issued_mono = time.monotonic()
+                    self._post_ui(self._render_inline_qr)
         srv_alive = self._server_proc is not None and self._server_proc.poll() is None
         tun_alive = self._tunnel_proc is not None and self._tunnel_proc.poll() is None
 
@@ -2585,6 +2608,7 @@ class LauncherApp:
             beacon_enabled=self.settings.beacon_enabled,
             explicit_remote=self.settings.beacon_git_remote,
             beacon_branch=self.settings.beacon_branch,
+            allow_upstream_protected=self.settings.beacon_allow_upstream,
             verify_live=True,
             runtime_dir=RUNTIME_DIR,
             out_meta=meta,

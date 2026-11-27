@@ -1251,4 +1251,191 @@ async def test_reg9_pairing_race_https_cookies_revoke_and_beacon(tmp_path: Path)
         is None
     )
 
+    subprocess.run(
+        ["git", "config", "--unset", "url.https://github.com/wwd177/stayy.git.pushInsteadOf"],
+        cwd=str(proj),
+        check=True,
+        capture_output=True,
+    )
+    assert (
+        resolve_explicit_beacon_target(
+            proj,
+            beacon_enabled=True,
+            explicit_remote="origin",
+            allow_upstream_protected=False,
+        )
+        is None
+    )
+    ok_upstream = resolve_explicit_beacon_target(
+        proj,
+        beacon_enabled=True,
+        explicit_remote="origin",
+        allow_upstream_protected=True,
+    )
+    assert ok_upstream is not None and ok_upstream[3] == "https://wwd177.github.io/stayy/"
+
+
+def _raw_http_exchange(host: str, port: int, chunks: list[bytes]) -> bytes:
+    with socket.create_connection((host, port), timeout=5.0) as sock:
+        for ch in chunks:
+            sock.sendall(ch)
+            time.sleep(0.01)
+        out = bytearray()
+        while True:
+            part = sock.recv(4096)
+            if not part:
+                break
+            out.extend(part)
+        return bytes(out)
+
+
+@pytest.mark.asyncio
+async def test_reg10_chunked_post_cf_https_cookie_beacon_cors_and_pair_check(tmp_path: Path) -> None:
+    """Verify reverse-proxy chunked POST handling, Quick Tunnel __Host- cookies, beacon Origin allowlist, and pair check."""
+    tok = "stayy-chunked-post-tok-8877"
+    cfg = _make_cfg(
+        tmp_path,
+        web_access_token=tok,
+        trust_cf_proxy_headers=False,
+        beacon_enabled=True,
+        beacon_git_remote="https://github.com/alice/my-stayy-pages.git",
+    )
+    sessions = SessionManager(cfg, command_override=[sys.executable, str(MOCK_AGY)])
+    pwa = WebPwaServer(
+        cfg,
+        session_manager=sessions,
+        access_token=tok,
+        runtime_dir=tmp_path / "rt_reg10",
+        ide_store_dir=tmp_path / "ide_r10",
+        cli_store_dir=tmp_path / "cli_r10",
+        codex_store_dir=tmp_path / "cdx_r10",
+    )
+    stop_event = asyncio.Event()
+    task = asyncio.create_task(pwa.run(stop_event=stop_event))
+    try:
+        for _ in range(40):
+            if pwa.admin_port > 0:
+                break
+            await asyncio.sleep(0.05)
+        assert pwa.admin_port > 0
+
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        req_pair = urllib.request.Request(
+            f"http://127.0.0.1:{pwa.admin_port}/admin/pair",
+            method="POST",
+            data=b"{}",
+            headers={"X-Admin-Token": pwa.admin_secret},
+        )
+        pair_code = await asyncio.to_thread(
+            lambda: json.loads(opener.open(req_pair, timeout=3).read().decode("utf-8"))["code"]
+        )
+
+        def _check_pair_valid() -> bool:
+            req_chk = urllib.request.Request(
+                f"http://127.0.0.1:{pwa.admin_port}/admin/health",
+                headers={"X-Admin-Token": pwa.admin_secret, "X-Check-Pair-Code": pair_code},
+            )
+            return bool(json.loads(opener.open(req_chk, timeout=3).read().decode("utf-8"))["pair_code_valid"])
+
+        assert await asyncio.to_thread(_check_pair_valid) is True
+
+        req_chunks = [
+            (
+                f"POST /api/pair HTTP/1.1\r\n"
+                f"Host: 127.0.0.1:{cfg.web_pwa_port}\r\n"
+                f"Origin: http://127.0.0.1:{cfg.web_pwa_port}\r\n"
+                f"Sec-Fetch-Site: same-origin\r\n"
+                f"X-Pair-Code: {pair_code}\r\n"
+                f"Transfer-Encoding: chunked\r\n\r\n"
+            ).encode("ascii"),
+            b"0\r\n",
+            b"\r\n",
+        ]
+        raw_resp = await asyncio.to_thread(_raw_http_exchange, "127.0.0.1", cfg.web_pwa_port, req_chunks)
+        resp_txt = raw_resp.decode("utf-8", errors="replace")
+        assert resp_txt.startswith("HTTP/1.1 200 OK")
+        set_cookie_line = next(
+            (ln.split(":", 1)[1].strip() for ln in resp_txt.splitlines() if ln.lower().startswith("set-cookie:")),
+            "",
+        )
+        assert set_cookie_line.startswith("stayy_session=")
+        cookie_kv = set_cookie_line.split(";", 1)[0]
+
+        assert await asyncio.to_thread(_check_pair_valid) is False
+
+        async with websockets.connect(
+            f"ws://127.0.0.1:{cfg.web_pwa_port}/ws",
+            additional_headers={"Cookie": cookie_kv},
+        ) as ws_ck:
+            hello = json.loads(await asyncio.wait_for(ws_ck.recv(), timeout=4.0))
+            assert hello["type"] == "hello"
+
+        https_chunks = [
+            (
+                f"POST /api/auth/login HTTP/1.1\r\n"
+                f"Host: demo-stayy.trycloudflare.com\r\n"
+                f"Origin: https://demo-stayy.trycloudflare.com\r\n"
+                f"Sec-Fetch-Site: same-origin\r\n"
+                f"Authorization: Bearer {tok}\r\n"
+                f"Transfer-Encoding: chunked\r\n\r\n"
+                f"0\r\n\r\n"
+            ).encode("ascii")
+        ]
+        raw_https = await asyncio.to_thread(_raw_http_exchange, "127.0.0.1", cfg.web_pwa_port, https_chunks)
+        https_txt = raw_https.decode("utf-8", errors="replace")
+        assert https_txt.startswith("HTTP/1.1 200 OK")
+        assert "__Host-stayy_session=" in https_txt and "Secure" in https_txt and "SameSite=Strict" in https_txt
+
+        smug_resp = await asyncio.to_thread(
+            _raw_http_exchange,
+            "127.0.0.1",
+            cfg.web_pwa_port,
+            [(
+                f"POST /api/pair HTTP/1.1\r\nHost: 127.0.0.1:{cfg.web_pwa_port}\r\n"
+                "Transfer-Encoding: chunked\r\nContent-Length: 0\r\n\r\n0\r\n\r\n"
+            ).encode("ascii")],
+        )
+        assert smug_resp.startswith(b"HTTP/1.1 400 Bad Request")
+
+        big_cl_resp = await asyncio.to_thread(
+            _raw_http_exchange,
+            "127.0.0.1",
+            cfg.web_pwa_port,
+            [(
+                f"POST /api/pair HTTP/1.1\r\nHost: 127.0.0.1:{cfg.web_pwa_port}\r\n"
+                "Content-Length: 99999\r\n\r\n"
+            ).encode("ascii")],
+        )
+        assert big_cl_resp.startswith(b"HTTP/1.1 413 Payload Too Large")
+
+        big_chunk_resp = await asyncio.to_thread(
+            _raw_http_exchange,
+            "127.0.0.1",
+            cfg.web_pwa_port,
+            [(
+                f"POST /api/pair HTTP/1.1\r\nHost: 127.0.0.1:{cfg.web_pwa_port}\r\n"
+                "Transfer-Encoding: chunked\r\n\r\n2000\r\n"
+            ).encode("ascii")],
+        )
+        assert big_chunk_resp.startswith(b"HTTP/1.1 413 Payload Too Large")
+
+        async with websockets.connect(
+            f"ws://127.0.0.1:{cfg.web_pwa_port}/ws?token={tok}",
+            origin=websockets.Origin("https://alice.github.io"),
+        ) as ws_beacon:
+            hello_b = json.loads(await asyncio.wait_for(ws_beacon.recv(), timeout=4.0))
+            assert hello_b["type"] == "hello"
+
+        with pytest.raises(websockets.exceptions.ConnectionClosed) as evil_exc:
+            async with websockets.connect(
+                f"ws://127.0.0.1:{cfg.web_pwa_port}/ws?token={tok}",
+                origin=websockets.Origin("https://evil.github.io"),
+            ) as ws_evil:
+                await asyncio.wait_for(ws_evil.recv(), timeout=3.0)
+        assert evil_exc.value.rcvd is not None and evil_exc.value.rcvd.code == 4003
+    finally:
+        stop_event.set()
+        await asyncio.wait_for(task, timeout=5.0)
+        await sessions.shutdown_all()
+
 
