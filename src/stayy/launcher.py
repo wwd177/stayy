@@ -27,6 +27,7 @@ import sys
 import threading
 import time
 import tkinter as tk
+import urllib.error
 import urllib.request
 import webbrowser
 import zlib
@@ -484,6 +485,68 @@ def probe_stayy_gateway_identity(host: str, port: int, timeout: float = 0.6) -> 
         return "foreign"
 
 
+def _allocate_loopback_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        return int(s.getsockname()[1])
+
+
+def probe_cloudflared_ready(metrics_port: int, timeout: float = 0.8) -> tuple[bool, int]:
+    """Query cloudflared `/ready` metrics endpoint, returning `(is_ready, ready_connections)`."""
+    if metrics_port <= 0:
+        return False, -1
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    url = f"http://127.0.0.1:{int(metrics_port)}/ready"
+    raw = b""
+    status_code = 0
+    try:
+        with opener.open(url, timeout=timeout) as resp:
+            status_code = int(resp.status)
+            raw = resp.read(8192)
+    except urllib.error.HTTPError as err:
+        status_code = int(err.code)
+        try:
+            raw = err.read(8192)
+        except Exception:
+            raw = b""
+        finally:
+            try:
+                err.close()
+            except Exception:
+                pass
+    except Exception:
+        return False, -1
+    try:
+        data = json.loads(raw.decode("utf-8", errors="replace")) if raw else {}
+    except Exception:
+        data = {}
+    ready_conns = int(data.get("readyConnections", 0) or 0) if isinstance(data, dict) else 0
+    return (status_code == 200 and ready_conns > 0), ready_conns
+
+
+def probe_tunnel_e2e_ping(tunnel_url: str, expected_service: str, timeout: float = 6.0) -> bool:
+    """Verify end-to-end reachability of a published Cloudflare Quick Tunnel `/ping` endpoint."""
+    clean = (tunnel_url or "").strip().rstrip("/")
+    if not clean:
+        return False
+    req = urllib.request.Request(
+        f"{clean}/ping?_t={int(time.time())}",
+        headers={"Cache-Control": "no-store"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            if resp.status != 200:
+                return False
+            data = json.loads(resp.read(4096).decode("utf-8", errors="replace"))
+            return (
+                isinstance(data, dict)
+                and data.get("ok") is True
+                and data.get("service") == expected_service
+            )
+    except Exception:
+        return False
+
+
 def find_external_server_processes(exclude_pids: set[int]) -> list[int]:
     """Return running Stayy backend server PIDs outside this launcher (NEVER matches qq_agy_bridge!)."""
     ps_script = r"""
@@ -608,6 +671,15 @@ class LauncherApp:
         self._tunnel_proc: subprocess.Popen[str] | None = None
         self._tunnel_url: str = ""
         self._tunnel_gen: int = 0
+        self._tunnel_metrics_port: int = 0
+        self._tunnel_started_mono: float = 0.0
+        self._tunnel_unready_since_mono: float = 0.0
+        self._tunnel_ready_conns: int = 0
+        self._tunnel_last_e2e_check_mono: float = 0.0
+        self._tunnel_e2e_fail_count: int = 0
+        self._tunnel_consecutive_restarts: int = 0
+        self._tunnel_last_restart_mono: float = 0.0
+        self._tunnel_last_warn_mono: float = 0.0
         self._server_external = False
         self._port_conflict = False
         self._desired_running = True
@@ -1926,7 +1998,7 @@ class LauncherApp:
         if self._closing:
             return
         threading.Thread(target=self._health_poll_worker, daemon=True).start()
-        self.root.after(2500, self._schedule_health_poll)
+        self.root.after(3500, self._schedule_health_poll)
 
     def _health_poll_worker(self, force: bool = False) -> None:
         if self._closing or (self._busy and not force):
@@ -1945,6 +2017,39 @@ class LauncherApp:
         srv_alive = self._server_proc is not None and self._server_proc.poll() is None
         tun_alive = self._tunnel_proc is not None and self._tunnel_proc.poll() is None
 
+        tun_ready = False
+        now_m = time.monotonic()
+        if tun_alive and self._tunnel_metrics_port > 0:
+            tun_ready, ready_conns = probe_cloudflared_ready(self._tunnel_metrics_port, timeout=0.8)
+            self._tunnel_ready_conns = max(0, int(ready_conns))
+            if tun_ready:
+                self._tunnel_unready_since_mono = 0.0
+                if self._tunnel_started_mono > 0.0 and (now_m - self._tunnel_started_mono) >= 35.0:
+                    self._tunnel_consecutive_restarts = 0
+                if (
+                    self._tunnel_url
+                    and self._tunnel_started_mono > 0.0
+                    and (now_m - self._tunnel_started_mono) >= 25.0
+                    and (self._tunnel_last_e2e_check_mono == 0.0 or (now_m - self._tunnel_last_e2e_check_mono) >= 90.0)
+                ):
+                    self._tunnel_last_e2e_check_mono = now_m
+                    ok_e2e = probe_tunnel_e2e_ping(self._tunnel_url, "stayy", timeout=6.0)
+                    self._tunnel_e2e_fail_count = 0 if ok_e2e else (self._tunnel_e2e_fail_count + 1)
+            else:
+                if self._tunnel_started_mono > 0.0 and (now_m - self._tunnel_started_mono) >= 18.0:
+                    if self._tunnel_unready_since_mono == 0.0:
+                        self._tunnel_unready_since_mono = now_m
+                else:
+                    self._tunnel_unready_since_mono = 0.0
+        else:
+            self._tunnel_ready_conns = 0
+            self._tunnel_unready_since_mono = 0.0
+
+        tun_zombie = tun_alive and (
+            (self._tunnel_unready_since_mono > 0.0 and (now_m - self._tunnel_unready_since_mono) >= 30.0)
+            or self._tunnel_e2e_fail_count >= 3
+        )
+
         need_srv_heal = (
             self._desired_running
             and not self._busy
@@ -1960,7 +2065,7 @@ class LauncherApp:
             and self.settings.web_pwa_enabled
             and self.settings.tunnel_enabled
             and pwa_open
-            and not tun_alive
+            and ((not tun_alive) or tun_zombie)
             and not self._closing
         )
 
@@ -1981,6 +2086,8 @@ class LauncherApp:
                         self._launch_server()
                         srv_alive = self._server_proc is not None and self._server_proc.poll() is None
 
+                tun_proc_cur = self._tunnel_proc
+                tun_alive_in_lock = tun_proc_cur is not None and tun_proc_cur.poll() is None
                 if (
                     self._desired_running
                     and not self._closing
@@ -1988,21 +2095,40 @@ class LauncherApp:
                     and self.settings.web_pwa_enabled
                     and self.settings.tunnel_enabled
                     and pwa_open
-                    and (self._tunnel_proc is None or self._tunnel_proc.poll() is not None)
+                    and ((not tun_alive_in_lock) or tun_zombie)
                 ):
                     now_t = time.monotonic()
-                    self._tunnel_restart_timestamps = [t for t in self._tunnel_restart_timestamps if now_t - t < 180.0]
-                    if len(self._tunnel_restart_timestamps) < 4:
-                        self._tunnel_restart_timestamps.append(now_t)
-                        self._enqueue_log("Tunnel", "检测到外网加密隧道中断，正在自动重连并同步信标...", "warn")
+                    cooldown_sec = (
+                        0.0
+                        if self._tunnel_last_restart_mono == 0.0
+                        else min(60.0, 8.0 * (2 ** min(self._tunnel_consecutive_restarts, 3)))
+                    )
+                    if (now_t - self._tunnel_last_restart_mono) >= cooldown_sec:
+                        self._tunnel_last_restart_mono = now_t
+                        self._tunnel_consecutive_restarts += 1
+                        if tun_alive_in_lock and tun_proc_cur is not None:
+                            self._enqueue_log(
+                                "Tunnel",
+                                f"检测到外网隧道假死（readyConnections={self._tunnel_ready_conns}，端到端连续失败={self._tunnel_e2e_fail_count}），正在自动重建隧道...",
+                                "warn",
+                            )
+                            self._tunnel_gen += 1
+                            kill_pid_tree(tun_proc_cur.pid)
+                            self._tunnel_proc = None
+                            self._tunnel_url = ""
+                        else:
+                            self._enqueue_log("Tunnel", "检测到外网加密隧道中断，正在自动重连并同步信标...", "warn")
                         self._launch_tunnel()
                         tun_alive = self._tunnel_proc is not None and self._tunnel_proc.poll() is None
+                        tun_ready = False
             finally:
                 self._op_lock.release()
 
-        self._post_ui(lambda: self._refresh_status_ui(pwa_open, srv_alive, tun_alive))
+        self._post_ui(
+            lambda p=pwa_open, s=srv_alive, t=tun_alive, r=tun_ready: self._refresh_status_ui(p, s, t, r)
+        )
 
-    def _refresh_status_ui(self, pwa_open: bool, srv_alive: bool, tun_alive: bool) -> None:
+    def _refresh_status_ui(self, pwa_open: bool, srv_alive: bool, tun_alive: bool, tun_ready: bool = False) -> None:
         if self._closing:
             return
         lan_ip = get_lan_ipv4()
@@ -2038,7 +2164,7 @@ class LauncherApp:
             self._set_card(self.engine_orb_lbl, self.engine_status_lbl, "red", "服务已停止")
 
         if pwa_open:
-            ext_addr = self.settings.public_base_url or (self._tunnel_url if tun_alive else "")
+            ext_addr = self.settings.public_base_url or (self._tunnel_url if (tun_alive and tun_ready) else "")
             if ext_addr:
                 self._set_card(
                     self.net_orb_lbl,
@@ -2048,6 +2174,16 @@ class LauncherApp:
                 )
                 self.net_detail_lbl.configure(
                     text=f"局域网：http://{lan_ip}:{port}   ·   外网：{ext_addr}"
+                )
+            elif tun_alive and not tun_ready and self._tunnel_started_mono > 0.0 and (time.monotonic() - self._tunnel_started_mono) >= 12.0:
+                self._set_card(
+                    self.net_orb_lbl,
+                    self.net_status_lbl,
+                    "amber",
+                    "外网隧道重连中（Edge 连接=0）· Wi-Fi 局域网正常",
+                )
+                self.net_detail_lbl.configure(
+                    text=f"局域网：http://{lan_ip}:{port}   ·   正重连 Cloudflare Edge..."
                 )
             elif tun_alive:
                 self._set_card(
@@ -2208,16 +2344,31 @@ class LauncherApp:
 
         self._tunnel_gen += 1
         cur_gen = self._tunnel_gen
+        metrics_port = _allocate_loopback_port()
+        self._tunnel_metrics_port = metrics_port
+        self._tunnel_started_mono = time.monotonic()
+        self._tunnel_unready_since_mono = 0.0
+        self._tunnel_ready_conns = 0
+        self._tunnel_last_e2e_check_mono = 0.0
+        self._tunnel_e2e_fail_count = 0
         self._tunnel_url = ""
         cmd = [
             str(cf_exe),
             "tunnel",
             "--url",
             f"http://127.0.0.1:{self.settings.web_pwa_port}",
+            "--metrics",
+            f"127.0.0.1:{metrics_port}",
             "--protocol",
             "http2",
             "--edge-ip-version",
             "4",
+            "--retries",
+            "15",
+            "--proxy-tcp-keepalive",
+            "15s",
+            "--proxy-keepalive-timeout",
+            "2m",
             "--no-autoupdate",
         ]
         self._enqueue_log("系统", "正在建立全球 4G/5G 加密隧道 (HTTP/2 直连)...", "sys")
@@ -2279,6 +2430,20 @@ class LauncherApp:
                             daemon=True,
                         ).start()
                     if not self._show_debug:
+                        if any(
+                            marker in line
+                            for marker in (
+                                "Unregistered tunnel connection",
+                                "Failed to dial",
+                                "Unable to establish connection",
+                                "connection with edge closed",
+                                "ERR ",
+                            )
+                        ):
+                            now_w = time.monotonic()
+                            if (now_w - self._tunnel_last_warn_mono) >= 15.0:
+                                self._tunnel_last_warn_mono = now_w
+                                self._enqueue_log("Tunnel", line, "warn")
                         continue
 
                 if source == "Engine" and "auto-switching to " in line:
@@ -2362,6 +2527,11 @@ class LauncherApp:
             kill_pid_tree(self._tunnel_proc.pid)
         self._tunnel_proc = None
         self._tunnel_url = ""
+        self._tunnel_metrics_port = 0
+        self._tunnel_started_mono = 0.0
+        self._tunnel_ready_conns = 0
+        self._tunnel_unready_since_mono = 0.0
+        self._tunnel_e2e_fail_count = 0
 
         if self._server_proc and self._server_proc.poll() is None:
             kill_pid_tree(self._server_proc.pid)

@@ -978,7 +978,7 @@ class WebPwaServer:
             )
         return True, len(stale_ws), new_epoch
 
-    async def _safe_send(self, ws: ServerConnection, raw_or_dict: str | dict[str, Any], timeout: float = 4.0) -> bool:
+    async def _safe_send(self, ws: ServerConnection, raw_or_dict: str | dict[str, Any], timeout: float = 15.0) -> bool:
         raw = raw_or_dict if isinstance(raw_or_dict, str) else json.dumps(raw_or_dict, ensure_ascii=False)
         try:
             await asyncio.wait_for(ws.send(raw), timeout=timeout)
@@ -1004,10 +1004,10 @@ class WebPwaServer:
             return
         raw = json.dumps(payload, ensure_ascii=False)
         if len(clients_snapshot) == 1:
-            await self._safe_send(clients_snapshot[0], raw, timeout=3.5)
+            await self._safe_send(clients_snapshot[0], raw, timeout=12.0)
             return
         await asyncio.gather(
-            *(self._safe_send(c, raw, timeout=3.5) for c in clients_snapshot),
+            *(self._safe_send(c, raw, timeout=12.0) for c in clients_snapshot),
             return_exceptions=True,
         )
 
@@ -1298,6 +1298,7 @@ class WebPwaServer:
         }
 
     async def _screen_client_sender(self, ws: ServerConnection, q: asyncio.Queue[dict[str, Any]]) -> None:
+        timeout_streak = 0
         try:
             while True:
                 frame = await q.get()
@@ -1305,7 +1306,12 @@ class WebPwaServer:
                 if not self.auth.is_epoch_active(ep):
                     break
                 try:
-                    await asyncio.wait_for(ws.send(json.dumps(frame, ensure_ascii=False)), timeout=2.5)
+                    await asyncio.wait_for(ws.send(json.dumps(frame, ensure_ascii=False)), timeout=8.0)
+                    timeout_streak = 0
+                except asyncio.TimeoutError:
+                    timeout_streak += 1
+                    if timeout_streak >= 3:
+                        break
                 except Exception:
                     break
         except asyncio.CancelledError:
@@ -1448,8 +1454,281 @@ class WebPwaServer:
             self._client_epochs[ws] = conn_epoch
 
         uploads: dict[str, _UploadState] = {}
+        ws_tasks: set[asyncio.Task[None]] = set()
+        inflight_keys: set[str] = set()
+        desk_input_lock = asyncio.Lock()
+        upload_q: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+
+        def _spawn_ws_task(coro: Awaitable[None], *, coalesce_key: str = "") -> None:
+            if coalesce_key:
+                if coalesce_key in inflight_keys:
+                    if asyncio.iscoroutine(coro):
+                        coro.close()
+                    return
+                inflight_keys.add(coalesce_key)
+            t = asyncio.create_task(coro)
+            ws_tasks.add(t)
+
+            def _cleanup(done_t: asyncio.Task[None]) -> None:
+                ws_tasks.discard(done_t)
+                if coalesce_key:
+                    inflight_keys.discard(coalesce_key)
+                if not done_t.cancelled():
+                    exc = done_t.exception()
+                    if exc is not None:
+                        logger.debug("WS background handler error (%s): %s", coalesce_key or "task", exc)
+
+            t.add_done_callback(_cleanup)
+
+        async def _upload_worker() -> None:
+            while True:
+                umsg = await upload_q.get()
+                try:
+                    utype = umsg.get("type")
+                    if utype == "upload_init":
+                        if len(uploads) >= 8:
+                            await self._safe_send(ws, {"type": "toast", "level": "err", "text": "同时上传文件过多，请稍候"})
+                            continue
+                        uid = str(umsg.get("upload_id") or uuid.uuid4().hex)
+                        if uid in uploads:
+                            uploads.pop(uid).abort()
+                        safe_name = sanitize_filename(str(umsg.get("name") or "upload.bin"))
+                        size = self._safe_int_param(umsg.get("size"), -1, min_val=-1, max_val=MAX_UPLOAD_BYTES + 1)
+                        if size < 0 or size > MAX_UPLOAD_BYTES:
+                            await self._safe_send(ws, {"type": "toast", "level": "err", "text": "文件大小无效或超过 100MB 上限"})
+                            continue
+                        PROJECT_INBOX_DIR.mkdir(parents=True, exist_ok=True)
+                        dest = PROJECT_INBOX_DIR / f"pwa_{int(time.time())}_{uuid.uuid4().hex[:5]}_{safe_name}"
+                        uploads[uid] = _UploadState(dest, safe_name, size)
+                        await self._safe_send(ws, {"type": "upload_ack", "upload_id": uid})
+                    elif utype == "upload_chunk":
+                        uid = str(umsg.get("upload_id") or "")
+                        state = uploads.get(uid)
+                        if state is None:
+                            continue
+                        try:
+                            chunk_bytes = base64.b64decode(str(umsg.get("data") or ""))
+                            await asyncio.to_thread(state.write, chunk_bytes)
+                            await self._safe_send(
+                                ws,
+                                {
+                                    "type": "upload_progress",
+                                    "upload_id": uid,
+                                    "written": state.written,
+                                    "total": state.expected_size,
+                                },
+                            )
+                        except Exception as exc:
+                            state.abort()
+                            uploads.pop(uid, None)
+                            await self._safe_send(ws, {"type": "toast", "level": "err", "text": f"上传出错：{exc}"})
+                    elif utype == "upload_complete":
+                        uid = str(umsg.get("upload_id") or "")
+                        state = uploads.pop(uid, None)
+                        if state is None:
+                            continue
+                        try:
+                            final_path = await asyncio.to_thread(state.finalize)
+                        except Exception as exc:
+                            await self._safe_send(ws, {"type": "toast", "level": "err", "text": f"上传校验未通过：{exc}"})
+                            continue
+                        prune_inbox(PROJECT_INBOX_DIR, keep=40, prefix_only="pwa_")
+                        is_img = final_path.suffix.lower() in ALLOWED_IMAGE_EXTS
+                        await self._safe_send(
+                            ws,
+                            {
+                                "type": "upload_done",
+                                "upload_id": uid,
+                                **self._media_ref(final_path),
+                                "name": state.name,
+                                "path": str(final_path),
+                                "is_image": is_img,
+                            },
+                        )
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    logger.debug("Upload worker error: %s", exc)
+                finally:
+                    upload_q.task_done()
+
+        async def _run_desktop_frame() -> None:
+            try:
+                shot, cur_info = await asyncio.gather(
+                    asyncio.to_thread(self._screen_capturer, PROJECT_INBOX_DIR, 1440, 80),
+                    asyncio.to_thread(self._cursor_reader),
+                )
+                await self._safe_send(
+                    ws,
+                    {
+                        "type": "desktop_frame",
+                        **self._live_frame_ref(shot),
+                        "ts": int(time.time() * 1000),
+                        "cursor": cur_info,
+                    },
+                )
+            except Exception as exc:
+                await self._safe_send(ws, {"type": "toast", "level": "err", "text": f"截屏失败：{exc}"})
+
+        async def _run_cancel(cmsg: dict[str, Any]) -> None:
+            cur_slot = str(cmsg.get("slot") or self._active_slot)
+            req_mid = str(cmsg.get("msg_id") or "")
+            inf = self._slot_inflight.get(cur_slot)
+            if req_mid and inf and str(inf.get("msg_id") or "") != req_mid:
+                await self._safe_send(ws, {"type": "toast", "level": "info", "text": "该轮生成已结束。"})
+                return
+            killed = False
+            if inf and inf.get("msg_id"):
+                self._cancelled_reply_ids.add(str(inf["msg_id"]))
+            if inf and inf.get("pc_ide_cid") and self._pc_window_canceller is not None:
+                killed = await asyncio.to_thread(self._pc_window_canceller, str(inf["pc_ide_cid"])) or True
+            proc_cdx = self._slot_codex_procs.get(cur_slot)
+            if proc_cdx is not None and proc_cdx.returncode is None:
+                try:
+                    if sys.platform == "win32" and proc_cdx.pid:
+                        await asyncio.to_thread(_kill_process_tree_win32, proc_cdx.pid)
+                    else:
+                        proc_cdx.terminate()
+                    killed = True
+                except Exception:
+                    pass
+            ag_cancel = self._active_agent_cancels.get(cur_slot)
+            if ag_cancel is not None:
+                ag_cancel.set()
+                killed = True
+            ag_proc = self._active_agent_procs.get(cur_slot)
+            if ag_proc is not None and ag_proc.returncode is None and ag_proc.pid:
+                await asyncio.to_thread(kill_pid_tree_sync, ag_proc.pid)
+                killed = True
+            killed = (await self._session_for_slot(cur_slot).cancel_current()) or killed
+            note = "已停止当前生成。" if killed else "当前没有运行中的任务。"
+            await self._safe_send(ws, {"type": "toast", "level": "info", "text": note})
+
+        async def _run_ide_actions_inspect(req_cid: str) -> None:
+            actions = await asyncio.to_thread(self._ide_actions_inspector, req_cid)
+            if self.bark_notifier.enabled and actions:
+                ekeys = [str(a.get("event_key") or "") for a in actions if isinstance(a, dict) and a.get("event_key")]
+                if ekeys:
+                    await asyncio.to_thread(self.bark_notifier.notify_for_events, ekeys)
+            await self._safe_send(
+                ws,
+                {
+                    "type": "ide_actions",
+                    "mode": "manual_screen_only",
+                    "actions": actions,
+                },
+            )
+
+        async def _run_desktop_input(dmsg: dict[str, Any]) -> None:
+            async with desk_input_lock:
+                act_kind = str(dmsg.get("action") or "")
+                kname = str(dmsg.get("key") or "")
+                txt_payload = str(dmsg.get("text") or "")
+                try:
+                    xr = 0.5 if act_kind in {"key", "hotkey", "type_text"} else float(dmsg.get("x_ratio") if dmsg.get("x_ratio") is not None else 0.5)
+                    yr = 0.5 if act_kind in {"key", "hotkey", "type_text"} else float(dmsg.get("y_ratio") if dmsg.get("y_ratio") is not None else 0.5)
+                except (TypeError, ValueError):
+                    await self._safe_send(ws, {"type": "toast", "level": "err", "text": "触控坐标参数无效"})
+                    return
+
+                if not self.auth.is_epoch_active(conn_epoch):
+                    try:
+                        await ws.close(code=4001, reason="Revoked")
+                    except Exception:
+                        pass
+                    return
+
+                def _invoke_desk_handler() -> tuple[bool, str]:
+                    if not self.auth.is_epoch_active(conn_epoch):
+                        return (False, "配对已撤销，动作已取消")
+                    try:
+                        return self._desktop_input_handler(act_kind, xr, yr, kname, txt_payload)
+                    except TypeError:
+                        return self._desktop_input_handler(act_kind, xr, yr, kname)
+
+                ok, note = await asyncio.to_thread(_invoke_desk_handler)
+                quiet_act = bool(dmsg.get("quiet")) or act_kind in {"move", "scroll_up", "scroll_down"}
+                if not ok or (not quiet_act and act_kind in {"hotkey", "type_text", "right_click", "double_click"}):
+                    await self._safe_send(ws, {"type": "toast", "level": "info" if ok else "err", "text": note})
+                async with self._screen_lock:
+                    has_live = ws in self._screen_subs
+                if ok and not has_live:
+                    await asyncio.sleep(0.06 if act_kind == "move" else 0.16)
+                    try:
+                        shot, cur_info = await asyncio.gather(
+                            asyncio.to_thread(self._screen_capturer, PROJECT_INBOX_DIR, 1440, 80),
+                            asyncio.to_thread(self._cursor_reader),
+                        )
+                        await self._safe_send(
+                            ws,
+                            {
+                                "type": "desktop_frame",
+                                **self._live_frame_ref(shot),
+                                "ts": int(time.time() * 1000),
+                                "cursor": cur_info,
+                            },
+                        )
+                    except Exception:
+                        pass
+
+        async def _run_pc_system_inspect() -> None:
+            session_cur = self._session_for_slot(self._active_slot)
+            sys_info, clip_info = await asyncio.gather(
+                asyncio.to_thread(self._pc_system_inspector, session_cur.workspace),
+                asyncio.to_thread(self._pc_clipboard_getter),
+            )
+            await self._safe_send(ws, {"type": "pc_system_state", "system": sys_info, "clipboard": clip_info})
+
+        async def _run_pc_clipboard_get() -> None:
+            clip_info = await asyncio.to_thread(self._pc_clipboard_getter)
+            await self._safe_send(ws, {"type": "pc_clipboard", **clip_info})
+
+        async def _run_pc_clipboard_set(txt_clip: str) -> None:
+            ok, note = await asyncio.to_thread(self._pc_clipboard_setter, txt_clip)
+            await self._safe_send(ws, {"type": "toast", "level": "info" if ok else "err", "text": note})
+
+        async def _run_agents_refresh() -> None:
+            await asyncio.to_thread(self.agent_registry.refresh)
+            await self._safe_send(ws, {"type": "agents_catalog", "agents": self.agent_registry.public_catalog()})
+
+        async def _run_desktop_app_launch(req_app_id: str) -> None:
+            def _do_launch_guarded() -> tuple[bool, bool, str, str]:
+                with self._revoke_exec_lock:
+                    if not self.auth.is_epoch_active(conn_epoch):
+                        return False, False, "配对已撤销，应用启动已拦截", "revoked"
+                    if not self._build_capabilities()["remote_desktop"]["enabled"]:
+                        return False, False, "当前主机未启用远程桌面控制", "capabilities_denied"
+                    ok_l, foc_l, note_l = self.agent_registry.launch_desktop_app(req_app_id)
+                    return ok_l, foc_l, note_l, ""
+
+            ok_app, focused_app, note_app, err_code = await asyncio.to_thread(_do_launch_guarded)
+            if not self.auth.is_epoch_active(conn_epoch) or err_code == "revoked":
+                try:
+                    await ws.close(code=4001, reason="Revoked")
+                except Exception:
+                    pass
+                return
+            await self._safe_send(
+                ws,
+                {
+                    "type": "desktop_app_launched",
+                    "ok": ok_app,
+                    "app_id": req_app_id,
+                    "focused": focused_app,
+                    "note": note_app,
+                    **({"code": err_code} if err_code else {}),
+                },
+            )
+            if ok_app:
+                await self._safe_send(
+                    ws,
+                    {"type": "agents_catalog", "agents": self.agent_registry.public_catalog()},
+                )
+
+        upload_task: asyncio.Task[None] | None = None
         logger.info("Stayy 客户端已连接 (%s, epoch=%d)", ip, conn_epoch)
         try:
+            upload_task = asyncio.create_task(_upload_worker())
             slot = self._active_slot
             session = self._session_for_slot(slot)
             meta = self._slot_meta.get(slot, {})
@@ -1510,22 +1789,7 @@ class WebPwaServer:
                             {"type": "toast", "level": "err", "text": "当前主机不支持远程桌面抓取", "code": "capabilities_denied"},
                         )
                         continue
-                    try:
-                        shot, cur_info = await asyncio.gather(
-                            asyncio.to_thread(self._screen_capturer, PROJECT_INBOX_DIR, 1440, 80),
-                            asyncio.to_thread(self._cursor_reader),
-                        )
-                        await self._safe_send(
-                            ws,
-                            {
-                                "type": "desktop_frame",
-                                **self._live_frame_ref(shot),
-                                "ts": int(time.time() * 1000),
-                                "cursor": cur_info,
-                            },
-                        )
-                    except Exception as exc:
-                        await self._safe_send(ws, {"type": "toast", "level": "err", "text": f"截屏失败：{exc}"})
+                    _spawn_ws_task(_run_desktop_frame(), coalesce_key="desktop_frame")
 
                 elif mtype == "live_screen":
                     enable = bool(msg.get("enable"))
@@ -1543,107 +1807,14 @@ class WebPwaServer:
                     else:
                         await self._unsubscribe_live_screen(ws)
 
-                elif mtype == "upload_init":
-                    if len(uploads) >= 8:
-                        await self._safe_send(ws, {"type": "toast", "level": "err", "text": "同时上传文件过多，请稍候"})
-                        continue
-                    uid = str(msg.get("upload_id") or uuid.uuid4().hex)
-                    if uid in uploads:
-                        uploads.pop(uid).abort()
-                    safe_name = sanitize_filename(str(msg.get("name") or "upload.bin"))
-                    size = self._safe_int_param(msg.get("size"), -1, min_val=-1, max_val=MAX_UPLOAD_BYTES + 1)
-                    if size < 0 or size > MAX_UPLOAD_BYTES:
-                        await self._safe_send(ws, {"type": "toast", "level": "err", "text": "文件大小无效或超过 100MB 上限"})
-                        continue
-                    PROJECT_INBOX_DIR.mkdir(parents=True, exist_ok=True)
-                    dest = PROJECT_INBOX_DIR / f"pwa_{int(time.time())}_{uuid.uuid4().hex[:5]}_{safe_name}"
-                    uploads[uid] = _UploadState(dest, safe_name, size)
-                    await self._safe_send(ws, {"type": "upload_ack", "upload_id": uid})
-
-                elif mtype == "upload_chunk":
-                    uid = str(msg.get("upload_id") or "")
-                    state = uploads.get(uid)
-                    if state is None:
-                        continue
-                    try:
-                        chunk_bytes = base64.b64decode(str(msg.get("data") or ""))
-                        await asyncio.to_thread(state.write, chunk_bytes)
-                        await self._safe_send(
-                            ws,
-                            {
-                                "type": "upload_progress",
-                                "upload_id": uid,
-                                "written": state.written,
-                                "total": state.expected_size,
-                            },
-                        )
-                    except Exception as exc:
-                        state.abort()
-                        uploads.pop(uid, None)
-                        await self._safe_send(ws, {"type": "toast", "level": "err", "text": f"上传出错：{exc}"})
-
-                elif mtype == "upload_complete":
-                    uid = str(msg.get("upload_id") or "")
-                    state = uploads.pop(uid, None)
-                    if state is None:
-                        continue
-                    try:
-                        final_path = await asyncio.to_thread(state.finalize)
-                    except Exception as exc:
-                        await self._safe_send(ws, {"type": "toast", "level": "err", "text": f"上传校验未通过：{exc}"})
-                        continue
-                    prune_inbox(PROJECT_INBOX_DIR, keep=40, prefix_only="pwa_")
-                    is_img = final_path.suffix.lower() in ALLOWED_IMAGE_EXTS
-                    await self._safe_send(
-                        ws,
-                        {
-                            "type": "upload_done",
-                            "upload_id": uid,
-                            **self._media_ref(final_path),
-                            "name": state.name,
-                            "path": str(final_path),
-                            "is_image": is_img,
-                        },
-                    )
+                elif mtype in {"upload_init", "upload_chunk", "upload_complete"}:
+                    upload_q.put_nowait(msg)
 
                 elif mtype == "cancel":
-                    cur_slot = str(msg.get("slot") or self._active_slot)
-                    req_mid = str(msg.get("msg_id") or "")
-                    inf = self._slot_inflight.get(cur_slot)
-                    if req_mid and inf and str(inf.get("msg_id") or "") != req_mid:
-                        await self._safe_send(
-                            ws, {"type": "toast", "level": "info", "text": "该轮生成已结束。"}
-                        )
-                        continue
-                    killed = False
-                    if inf and inf.get("msg_id"):
-                        self._cancelled_reply_ids.add(str(inf["msg_id"]))
-                    if inf and inf.get("pc_ide_cid") and self._pc_window_canceller is not None:
-                        killed = await asyncio.to_thread(self._pc_window_canceller, str(inf["pc_ide_cid"])) or True
-                    proc_cdx = self._slot_codex_procs.get(cur_slot)
-                    if proc_cdx is not None and proc_cdx.returncode is None:
-                        try:
-                            if sys.platform == "win32" and proc_cdx.pid:
-                                await asyncio.to_thread(_kill_process_tree_win32, proc_cdx.pid)
-                            else:
-                                proc_cdx.terminate()
-                            killed = True
-                        except Exception:
-                            pass
-                    ag_cancel = self._active_agent_cancels.get(cur_slot)
-                    if ag_cancel is not None:
-                        ag_cancel.set()
-                        killed = True
-                    ag_proc = self._active_agent_procs.get(cur_slot)
-                    if ag_proc is not None and ag_proc.returncode is None and ag_proc.pid:
-                        await asyncio.to_thread(kill_pid_tree_sync, ag_proc.pid)
-                        killed = True
-                    killed = (await self._session_for_slot(cur_slot).cancel_current()) or killed
-                    note = "已停止当前生成。" if killed else "当前没有运行中的任务。"
-                    await self._safe_send(ws, {"type": "toast", "level": "info", "text": note})
+                    _spawn_ws_task(_run_cancel(msg))
 
                 elif mtype == "list_conversations":
-                    await self._handle_list_conversations(ws)
+                    _spawn_ws_task(self._handle_list_conversations(ws), coalesce_key="list_conversations")
 
                 elif mtype == "select_conversation":
                     max_m = self._safe_int_param(msg.get("max_messages"), 200, min_val=50, max_val=3000)
@@ -1690,29 +1861,16 @@ class WebPwaServer:
                     t.add_done_callback(self._tasks.discard)
 
                 elif mtype == "workspace_inspect":
-                    await self._handle_workspace_inspect(ws, str(msg.get("rel_dir") or ""))
+                    _spawn_ws_task(self._handle_workspace_inspect(ws, str(msg.get("rel_dir") or "")))
 
                 elif mtype == "workspace_diff":
-                    await self._handle_workspace_diff(ws, str(msg.get("path") or ""))
+                    _spawn_ws_task(self._handle_workspace_diff(ws, str(msg.get("path") or "")))
 
                 elif mtype == "workspace_file":
-                    await self._handle_workspace_file(ws, str(msg.get("path") or ""))
+                    _spawn_ws_task(self._handle_workspace_file(ws, str(msg.get("path") or "")))
 
                 elif mtype == "ide_actions_inspect":
-                    req_cid = str(msg.get("conversation_id") or "")
-                    actions = await asyncio.to_thread(self._ide_actions_inspector, req_cid)
-                    if self.bark_notifier.enabled and actions:
-                        ekeys = [str(a.get("event_key") or "") for a in actions if isinstance(a, dict) and a.get("event_key")]
-                        if ekeys:
-                            await asyncio.to_thread(self.bark_notifier.notify_for_events, ekeys)
-                    await self._safe_send(
-                        ws,
-                        {
-                            "type": "ide_actions",
-                            "mode": "manual_screen_only",
-                            "actions": actions,
-                        },
-                    )
+                    _spawn_ws_task(_run_ide_actions_inspect(str(msg.get("conversation_id") or "")))
 
                 elif mtype == "ide_action_invoke":
                     # Branch B hard enforcement: NEVER perform blind remote button click; zero desktop input!
@@ -1729,117 +1887,22 @@ class WebPwaServer:
                             {"type": "toast", "level": "err", "text": "当前主机未启用远程桌面输入", "code": "capabilities_denied"},
                         )
                         continue
-                    act_kind = str(msg.get("action") or "")
-                    kname = str(msg.get("key") or "")
-                    txt_payload = str(msg.get("text") or "")
-                    try:
-                        xr = 0.5 if act_kind in {"key", "hotkey", "type_text"} else float(msg.get("x_ratio") if msg.get("x_ratio") is not None else 0.5)
-                        yr = 0.5 if act_kind in {"key", "hotkey", "type_text"} else float(msg.get("y_ratio") if msg.get("y_ratio") is not None else 0.5)
-                    except (TypeError, ValueError):
-                        await self._safe_send(ws, {"type": "toast", "level": "err", "text": "触控坐标参数无效"})
-                        continue
-
-                    if not self.auth.is_epoch_active(conn_epoch):
-                        await ws.close(code=4001, reason="Revoked")
-                        break
-
-                    def _invoke_desk_handler() -> tuple[bool, str]:
-                        if not self.auth.is_epoch_active(conn_epoch):
-                            return (False, "配对已撤销，动作已取消")
-                        try:
-                            return self._desktop_input_handler(act_kind, xr, yr, kname, txt_payload)
-                        except TypeError:
-                            return self._desktop_input_handler(act_kind, xr, yr, kname)
-
-                    ok, note = await asyncio.to_thread(_invoke_desk_handler)
-                    quiet_act = bool(msg.get("quiet")) or act_kind in {"move", "scroll_up", "scroll_down"}
-                    if not ok or (not quiet_act and act_kind in {"hotkey", "type_text", "right_click", "double_click"}):
-                        await self._safe_send(
-                            ws,
-                            {"type": "toast", "level": "info" if ok else "err", "text": note},
-                        )
-                    async with self._screen_lock:
-                        has_live = ws in self._screen_subs
-                    if ok and not has_live:
-                        await asyncio.sleep(0.06 if act_kind == "move" else 0.16)
-                        try:
-                            shot, cur_info = await asyncio.gather(
-                                asyncio.to_thread(self._screen_capturer, PROJECT_INBOX_DIR, 1440, 80),
-                                asyncio.to_thread(self._cursor_reader),
-                            )
-                            await self._safe_send(
-                                ws,
-                                {
-                                    "type": "desktop_frame",
-                                    **self._live_frame_ref(shot),
-                                    "ts": int(time.time() * 1000),
-                                    "cursor": cur_info,
-                                },
-                            )
-                        except Exception:
-                            pass
+                    _spawn_ws_task(_run_desktop_input(msg))
 
                 elif mtype == "pc_system_inspect":
-                    session_cur = self._session_for_slot(self._active_slot)
-                    sys_info, clip_info = await asyncio.gather(
-                        asyncio.to_thread(self._pc_system_inspector, session_cur.workspace),
-                        asyncio.to_thread(self._pc_clipboard_getter),
-                    )
-                    await self._safe_send(
-                        ws,
-                        {"type": "pc_system_state", "system": sys_info, "clipboard": clip_info},
-                    )
+                    _spawn_ws_task(_run_pc_system_inspect(), coalesce_key="pc_system_inspect")
 
                 elif mtype == "pc_clipboard_get":
-                    clip_info = await asyncio.to_thread(self._pc_clipboard_getter)
-                    await self._safe_send(ws, {"type": "pc_clipboard", **clip_info})
+                    _spawn_ws_task(_run_pc_clipboard_get())
 
                 elif mtype == "pc_clipboard_set":
-                    ok, note = await asyncio.to_thread(self._pc_clipboard_setter, str(msg.get("text") or ""))
-                    await self._safe_send(
-                        ws,
-                        {"type": "toast", "level": "info" if ok else "err", "text": note},
-                    )
+                    _spawn_ws_task(_run_pc_clipboard_set(str(msg.get("text") or "")))
 
                 elif mtype == "agents_refresh":
-                    await asyncio.to_thread(self.agent_registry.refresh)
-                    await self._safe_send(
-                        ws,
-                        {"type": "agents_catalog", "agents": self.agent_registry.public_catalog()},
-                    )
+                    _spawn_ws_task(_run_agents_refresh(), coalesce_key="agents_refresh")
 
                 elif mtype == "desktop_app_launch":
-                    req_app_id = str(msg.get("app_id") or "").strip().lower()
-
-                    def _do_launch_guarded() -> tuple[bool, bool, str, str]:
-                        with self._revoke_exec_lock:
-                            if not self.auth.is_epoch_active(conn_epoch):
-                                return False, False, "配对已撤销，应用启动已拦截", "revoked"
-                            if not self._build_capabilities()["remote_desktop"]["enabled"]:
-                                return False, False, "当前主机未启用远程桌面控制", "capabilities_denied"
-                            ok_l, foc_l, note_l = self.agent_registry.launch_desktop_app(req_app_id)
-                            return ok_l, foc_l, note_l, ""
-
-                    ok_app, focused_app, note_app, err_code = await asyncio.to_thread(_do_launch_guarded)
-                    if not self.auth.is_epoch_active(conn_epoch) or err_code == "revoked":
-                        await ws.close(code=4001, reason="Revoked")
-                        break
-                    await self._safe_send(
-                        ws,
-                        {
-                            "type": "desktop_app_launched",
-                            "ok": ok_app,
-                            "app_id": req_app_id,
-                            "focused": focused_app,
-                            "note": note_app,
-                            **({"code": err_code} if err_code else {}),
-                        },
-                    )
-                    if ok_app:
-                        await self._safe_send(
-                            ws,
-                            {"type": "agents_catalog", "agents": self.agent_registry.public_catalog()},
-                        )
+                    _spawn_ws_task(_run_desktop_app_launch(str(msg.get("app_id") or "").strip().lower()))
 
                 elif mtype == "chat":
                     req_slot = str(msg.get("slot") or self._active_slot)
@@ -1850,6 +1913,13 @@ class WebPwaServer:
             pass
         finally:
             await self._unsubscribe_live_screen(ws)
+            to_cancel: list[asyncio.Task[None]] = list(ws_tasks)
+            if upload_task is not None:
+                to_cancel.append(upload_task)
+            for wt in to_cancel:
+                wt.cancel()
+            if to_cancel:
+                await asyncio.gather(*to_cancel, return_exceptions=True)
             for st in uploads.values():
                 st.abort()
             async with self._clients_lock:
@@ -4186,8 +4256,9 @@ class WebPwaServer:
         serve_kwargs: dict[str, Any] = {
             "process_request": self._process_request,
             "compression": None,
-            "ping_interval": 20,
-            "ping_timeout": 20,
+            "ping_interval": 25,
+            "ping_timeout": 45,
+            "close_timeout": 5,
             "max_size": 16 * 1024 * 1024,
         }
         if sys.platform == "win32":

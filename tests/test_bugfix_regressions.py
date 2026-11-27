@@ -606,3 +606,151 @@ async def test_reg5_tools_wizard_registry_and_cli_adapter_guards(
     )
     assert reg.get_agent("doubao_api") is not None
     assert reg.get_agent("doubao_api").configured is False
+
+
+@pytest.mark.asyncio
+async def test_reg6_ws_ping_never_blocked_by_slow_handler_and_tunnel_zombie_probe(tmp_path: Path) -> None:
+    """Verify slow WebSocket handlers never block ping/pong, tunnel probes detect zombies, and client JS has resilient settings."""
+    from stayy.launcher import probe_cloudflared_ready, probe_tunnel_e2e_ping
+
+    # 1. Slow blocking handlers must not stall WebSocket ping/pong responses
+    def _slow_ide_actions(_cid: str = "") -> list[dict[str, object]]:
+        time.sleep(1.2)
+        return [{"token": "act-1", "label": "Retry", "kind": "action"}]
+
+    def _slow_pc_system(_ws: Path | None = None) -> dict[str, object]:
+        time.sleep(1.2)
+        return {"ok": True, "hostname": "stayy-test-host"}
+
+    port = _free_port()
+    tok = "reg6-ws-stability-token"
+    cfg = _make_cfg(tmp_path, web_pwa_port=port, web_access_token=tok)
+    sessions = SessionManager(cfg, command_override=[sys.executable, str(MOCK_AGY)])
+    pwa = WebPwaServer(
+        cfg,
+        session_manager=sessions,
+        access_token=tok,
+        env_path=tmp_path / ".env",
+        runtime_dir=tmp_path / ".runtime",
+        ide_store_dir=tmp_path / "ide_r6",
+        cli_store_dir=tmp_path / "cli_r6",
+        codex_store_dir=tmp_path / "cdx_r6",
+        dsh_store_dir=tmp_path / "dsh_r6",
+        workbuddy_store_dir=tmp_path / "wb_r6",
+        copilot_store_dir=tmp_path / "cop_r6",
+        ecosystem_project_dir=tmp_path,
+        ide_actions_inspector=_slow_ide_actions,
+        pc_clipboard_getter=lambda: {"ok": True, "text": "", "truncated": False, "length": 0},
+        pc_system_inspector=_slow_pc_system,
+    )
+    stop_event = asyncio.Event()
+    pwa_task = asyncio.create_task(pwa.run(stop_event=stop_event))
+    try:
+        for _ in range(50):
+            if pwa.admin_port > 0:
+                break
+            await asyncio.sleep(0.05)
+        assert pwa.admin_port > 0
+
+        async with websockets.connect(f"ws://127.0.0.1:{port}/ws?token={tok}") as ws:
+            hello = json.loads(await asyncio.wait_for(ws.recv(), timeout=3.0))
+            assert hello["type"] == "hello"
+
+            await ws.send(json.dumps({"type": "ide_actions_inspect", "conversation_id": "conv-1"}))
+            await ws.send(json.dumps({"type": "pc_system_inspect"}))
+            await asyncio.sleep(0.05)
+
+            t0 = time.monotonic()
+            await ws.send(json.dumps({"type": "ping", "ts": 123456789}))
+
+            saw_pong = False
+            pong_elapsed = 999.0
+            saw_actions = False
+            saw_sys = False
+            deadline = time.monotonic() + 5.0
+            while time.monotonic() < deadline and not (saw_pong and saw_actions and saw_sys):
+                raw = await asyncio.wait_for(ws.recv(), timeout=max(0.5, deadline - time.monotonic()))
+                ev = json.loads(raw)
+                etype = ev.get("type")
+                if etype == "pong":
+                    pong_elapsed = time.monotonic() - t0
+                    saw_pong = True
+                elif etype == "ide_actions":
+                    saw_actions = bool(ev.get("actions"))
+                elif etype == "pc_system_state":
+                    saw_sys = (ev.get("system") or {}).get("hostname") == "stayy-test-host"
+
+            assert saw_pong is True
+            assert pong_elapsed < 0.35, f"ping/pong blocked by slow handlers: {pong_elapsed:.3f}s"
+            assert saw_actions is True
+            assert saw_sys is True
+    finally:
+        stop_event.set()
+        await asyncio.wait_for(pwa_task, timeout=5.0)
+        await sessions.shutdown_all()
+
+    # 2. probe_cloudflared_ready & probe_tunnel_e2e_ping accurately distinguish healthy vs zombie states
+    state = {"ready": False, "service": "stayy", "ping_code": 200}
+
+    class _MockProbeHandler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def do_GET(self) -> None:
+            path = self.path.split("?", 1)[0]
+            if path == "/ready":
+                code = 200 if state["ready"] else 503
+                body = json.dumps({"status": code, "readyConnections": 2 if state["ready"] else 0}).encode("utf-8")
+            elif path == "/ping":
+                code = int(state["ping_code"])
+                if code == 200:
+                    body = json.dumps({"ok": True, "service": state["service"]}).encode("utf-8")
+                else:
+                    body = b"bad gateway"
+            else:
+                code = 404
+                body = b"{}"
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *_args) -> None:
+            return
+
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), _MockProbeHandler)
+    probe_port = srv.server_address[1]
+    srv_thread = threading.Thread(target=srv.serve_forever, daemon=True)
+    srv_thread.start()
+    try:
+        ready_false, conns_false = probe_cloudflared_ready(probe_port, timeout=1.0)
+        assert ready_false is False
+        assert conns_false == 0
+
+        state["ready"] = True
+        ready_true, conns_true = probe_cloudflared_ready(probe_port, timeout=1.0)
+        assert ready_true is True
+        assert conns_true == 2
+
+        dead_ok, dead_conns = probe_cloudflared_ready(_free_port(), timeout=0.5)
+        assert dead_ok is False
+        assert dead_conns == -1
+
+        assert probe_tunnel_e2e_ping(f"http://127.0.0.1:{probe_port}", expected_service="stayy", timeout=1.5) is True
+
+        state["service"] = "other-service"
+        assert probe_tunnel_e2e_ping(f"http://127.0.0.1:{probe_port}", expected_service="stayy", timeout=1.5) is False
+
+        state["service"] = "stayy"
+        state["ping_code"] = 502
+        assert probe_tunnel_e2e_ping(f"http://127.0.0.1:{probe_port}", expected_service="stayy", timeout=1.5) is False
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+    # 3. Client static/index.html retains resilient heartbeat & parallel beacon race markers
+    index_html = (Path(__file__).resolve().parent.parent / "src" / "stayy" / "static" / "index.html").read_text(encoding="utf-8")
+    for marker in ("missedPongCount", "15000", "65536", "Promise.any(sourcePromises)", "wasHidden"):
+        assert marker in index_html, f"missing client stability marker: {marker}"
+

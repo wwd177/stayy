@@ -5179,7 +5179,7 @@
     return JSON.parse(new TextDecoder().decode(pt));
   }
 
-  async function probePing(baseUrl, timeoutMs = 1700) {
+  async function probePing(baseUrl, timeoutMs = 3500) {
     if (!baseUrl) return false;
     const ctrl = new AbortController();
     const timer = setTimeout(() => ctrl.abort(), timeoutMs);
@@ -5196,7 +5196,7 @@
     }
   }
 
-  async function fetchJsonWithTimeout(url, timeoutMs = 3500, headers = {}) {
+  async function fetchJsonWithTimeout(url, timeoutMs = 6500, headers = {}) {
     const ctrl = new AbortController();
     const timer = setTimeout(() => ctrl.abort(), timeoutMs);
     try {
@@ -5212,21 +5212,15 @@
   let connStartedAt = 0;
   let inboundSeq = 0;
   let wakeWatchdogActive = false;
+  let missedPongCount = 0;
+  let wasHidden = false;
 
   async function resolveRemoteTunnelUrl(forceFresh = false) {
     let cached = '';
     try { cached = localStorage.getItem('stayy_last_tunnel') || ''; } catch (_) {}
     if (cached && !forceFresh) {
-      if (await probePing(cached, 1600)) return cached.replace(/\/$/, '');
+      if (await probePing(cached, 3200)) return cached.replace(/\/$/, '');
     }
-
-    // 1. Primary fast path: explicit absolute GitHub Pages `beacon.json` + relative `./beacon.json`
-    const pagesUrls = [];
-    if (beaconRepo && beaconRepo.includes('/')) {
-      const [owner, repo] = beaconRepo.split('/');
-      pagesUrls.push(`https://${owner.toLowerCase()}.github.io/${repo}/beacon.json?_t=${Date.now()}`);
-    }
-    pagesUrls.push(`./beacon.json?_t=${Date.now()}`);
 
     let bestFallbackUrl = '';
     let bestFallbackTs = -1;
@@ -5240,61 +5234,53 @@
     };
 
     let sawMacMismatch = false;
-    for (const pu of pagesUrls) {
-      try {
-        const env = await fetchJsonWithTimeout(pu, 3500);
-        if (env && env.ct) {
-          const dec = await decryptBeaconEnvelope(env, token);
-          const cand = String(dec.tunnel_url || '').replace(/\/$/, '');
-          if (cand) {
-            recordFallback(cand, dec, env);
-            if (await probePing(cand, 2200)) {
-              try { localStorage.setItem('stayy_last_tunnel', cand); } catch (_) {}
-              return cand;
-            }
-          }
-        }
-      } catch (e) {
+    const tryEnvelopePromise = (envPromise) => envPromise
+      .then(async (env) => {
+        if (!env || !env.ct) throw new Error('EMPTY');
+        const dec = await decryptBeaconEnvelope(env, token);
+        const cand = String(dec.tunnel_url || '').replace(/\/$/, '');
+        if (!cand) throw new Error('EMPTY');
+        recordFallback(cand, dec, env);
+        if (await probePing(cand, 4500)) return cand;
+        throw new Error('PING_FAIL');
+      })
+      .catch((e) => {
         if (String((e && e.message) || '') === 'BEACON_MAC_MISMATCH') sawMacMismatch = true;
-      }
-    }
-
-    // 2. Secondary concurrent race (both GitHub API & raw fire in parallel — fastest reachable tunnel wins!)
-    if (beaconRepo) {
-      const candidates = [
-        fetchJsonWithTimeout(
-          `https://raw.githubusercontent.com/${beaconRepo}/gh-pages/beacon.json?_t=${Date.now()}`,
-          3500
-        ),
-        fetchJsonWithTimeout(
-          `https://api.github.com/repos/${beaconRepo}/contents/beacon.json?ref=gh-pages&_t=${Date.now()}`,
-          3500,
-          { Accept: 'application/vnd.github.v3+json' }
-        ).then((meta) => JSON.parse(atob(String(meta.content || '').replace(/\s+/g, '')))),
-      ].map(async (p) => {
-        try {
-          const env2 = await p;
-          if (!env2 || !env2.ct) throw new Error('EMPTY');
-          const dec2 = await decryptBeaconEnvelope(env2, token);
-          const cand2 = String(dec2.tunnel_url || '').replace(/\/$/, '');
-          if (!cand2) throw new Error('EMPTY');
-          recordFallback(cand2, dec2, env2);
-          if (await probePing(cand2, 2200)) return cand2;
-          throw new Error('PING_FAIL');
-        } catch (e) {
-          if (String((e && e.message) || '') === 'BEACON_MAC_MISMATCH') sawMacMismatch = true;
-          throw e;
-        }
+        throw e;
       });
 
-      try {
-        const winner = await Promise.any(candidates);
-        if (winner) {
-          try { localStorage.setItem('stayy_last_tunnel', winner); } catch (_) {}
-          return winner;
-        }
-      } catch (_) {}
+    const sourcePromises = [];
+    if (beaconRepo && beaconRepo.includes('/')) {
+      const [owner, repo] = beaconRepo.split('/');
+      sourcePromises.push(tryEnvelopePromise(
+        fetchJsonWithTimeout(`https://${owner.toLowerCase()}.github.io/${repo}/beacon.json?_t=${Date.now()}`, 6500)
+      ));
     }
+    sourcePromises.push(tryEnvelopePromise(fetchJsonWithTimeout(`./beacon.json?_t=${Date.now()}`, 6500)));
+
+    if (beaconRepo) {
+      sourcePromises.push(tryEnvelopePromise(
+        fetchJsonWithTimeout(
+          `https://raw.githubusercontent.com/${beaconRepo}/gh-pages/beacon.json?_t=${Date.now()}`,
+          6500
+        )
+      ));
+      sourcePromises.push(tryEnvelopePromise(
+        fetchJsonWithTimeout(
+          `https://api.github.com/repos/${beaconRepo}/contents/beacon.json?ref=gh-pages&_t=${Date.now()}`,
+          6500,
+          { Accept: 'application/vnd.github.v3+json' }
+        ).then((meta) => JSON.parse(atob(String(meta.content || '').replace(/\s+/g, ''))))
+      ));
+    }
+
+    try {
+      const winner = await Promise.any(sourcePromises);
+      if (winner) {
+        try { localStorage.setItem('stayy_last_tunnel', winner); } catch (_) {}
+        return winner;
+      }
+    } catch (_) {}
 
     if (bestFallbackUrl) {
       try { localStorage.setItem('stayy_last_tunnel', bestFallbackUrl); } catch (_) {}
@@ -5330,17 +5316,18 @@
         connEpoch++;
         ws = null;
         try { sock.close(); } catch (_) {}
-        const delay = Math.min(3500, 450 * Math.pow(1.45, reconnectAttempt++));
+        const delay = Math.min(6000, 500 * Math.pow(1.45, Math.min(reconnectAttempt++, 8)));
         subInfo.textContent = '握手超时，正在切换重连...';
         reconnectTimer = setTimeout(connect, delay);
       }
-    }, 8000);
+    }, 15000);
   }
 
   function connect() {
     clearTimeout(reconnectTimer);
     clearPongWatchdog();
     wakeWatchdogActive = false;
+    missedPongCount = 0;
     if (ws && (ws.readyState === 0 || ws.readyState === 1)) return;
     if (connectingBeacon) return;
 
@@ -5360,7 +5347,7 @@
 
     connectingBeacon = true;
     subInfo.textContent = '正在自动寻址连接电脑...';
-    resolveRemoteTunnelUrl(reconnectAttempt > 0)
+    resolveRemoteTunnelUrl(reconnectAttempt >= 2)
       .then((tunnelOrigin) => {
         if (myEpoch !== connEpoch) return;
         connectingBeacon = false;
@@ -5377,7 +5364,7 @@
           $('authModal').classList.add('show');
           return;
         }
-        const delay = Math.min(4500, 900 * Math.pow(1.4, reconnectAttempt++));
+        const delay = Math.min(8000, 900 * Math.pow(1.4, Math.min(reconnectAttempt++, 8)));
         subInfo.textContent = '电脑端离线或网络不可达，正在重试...';
         reconnectTimer = setTimeout(connect, delay);
       });
@@ -5396,6 +5383,8 @@
       clearTimeout(streamHoldTimer);
       setReconnectBanner(false);
       reconnectAttempt = 0;
+      missedPongCount = 0;
+      wasHidden = false;
       lastInboundTs = Date.now();
       connDot.className = 'conn-dot online';
       $('authModal').classList.remove('show');
@@ -5403,29 +5392,50 @@
       clearInterval(pingTimer);
       const sendPing = () => {
         if (epochToken !== connEpoch || ws !== wsInstance || wsInstance.readyState !== 1) return;
+        if (document.visibilityState === 'hidden') return;
         const seqBefore = inboundSeq;
         try {
           wsInstance.send(JSON.stringify({ type: 'ping', ts: Date.now() }));
         } catch (_) {
           return;
         }
-        // Active half-open zombie socket watchdog using monotonic inbound sequence (immune to clock skew / same-ms race)
+        if (wsInstance.bufferedAmount > 65536) return;
+        // Two-stage zombie socket watchdog using monotonic inbound sequence
         if (!wakeWatchdogActive) {
           clearPongWatchdog();
           pongWatchdog = setTimeout(() => {
-            if (epochToken === connEpoch && ws === wsInstance && inboundSeq === seqBefore) {
-              connEpoch++;
-              ws = null;
-              try { wsInstance.close(); } catch (_) {}
-              connDot.className = 'conn-dot offline';
-              setReconnectBanner(true, '检测到网络切换，正在无缝重连...');
-              connect();
+            if (epochToken !== connEpoch || ws !== wsInstance) return;
+            if (inboundSeq !== seqBefore || document.visibilityState === 'hidden' || wsInstance.bufferedAmount > 65536) return;
+            missedPongCount++;
+            if (missedPongCount < 2) {
+              const retrySeq = inboundSeq;
+              try {
+                wsInstance.send(JSON.stringify({ type: 'ping', ts: Date.now() }));
+              } catch (_) {}
+              pongWatchdog = setTimeout(() => {
+                if (epochToken !== connEpoch || ws !== wsInstance) return;
+                if (inboundSeq === retrySeq && document.visibilityState !== 'hidden' && wsInstance.bufferedAmount <= 65536) {
+                  connEpoch++;
+                  ws = null;
+                  try { wsInstance.close(); } catch (_) {}
+                  connDot.className = 'conn-dot offline';
+                  setReconnectBanner(true, '检测到网络切换，正在无缝重连...');
+                  connect();
+                }
+              }, 6500);
+              return;
             }
-          }, 4800);
+            connEpoch++;
+            ws = null;
+            try { wsInstance.close(); } catch (_) {}
+            connDot.className = 'conn-dot offline';
+            setReconnectBanner(true, '检测到网络切换，正在无缝重连...');
+            connect();
+          }, 7500);
         }
       };
       sendPing();
-      pingTimer = setInterval(sendPing, 8000);
+      pingTimer = setInterval(sendPing, 15000);
       safeWsSend({ type: 'list_conversations' });
       if (pendingControlFrame && (Date.now() - pendingControlFrame.ts) < 15000) {
         const cf = pendingControlFrame.payload;
@@ -5443,6 +5453,7 @@
       if (epochToken !== connEpoch || ws !== wsInstance) return;
       inboundSeq++;
       lastInboundTs = Date.now();
+      missedPongCount = 0;
       wakeWatchdogActive = false;
       clearPongWatchdog();
       let data = null;
@@ -5798,6 +5809,7 @@
       clearInterval(pingTimer);
       clearPongWatchdog();
       wakeWatchdogActive = false;
+      missedPongCount = 0;
       ws = null;
       branchingInFlight = false;
       branchDraftByReq.clear();
@@ -5834,28 +5846,37 @@
         setStreamingState(false);
       }
       setReconnectBanner(true, '连接中断，正在自动恢复...');
-      const baseDelay = Math.min(3500, 380 * Math.pow(1.42, reconnectAttempt++));
-      const jitter = Math.floor(Math.random() * 180);
+      const baseDelay = Math.min(8000, 500 * Math.pow(1.45, Math.min(reconnectAttempt++, 8)));
+      const jitter = Math.floor(Math.random() * 200);
       subInfo.textContent = '正在重连...';
       reconnectTimer = setTimeout(connect, baseDelay + jitter);
     };
   }
 
-  function handleAppWakeup() {
-    if (document.visibilityState === 'hidden') return;
+  function handleAppWakeup(ev) {
+    if (document.visibilityState === 'hidden') {
+      wasHidden = true;
+      clearPongWatchdog();
+      wakeWatchdogActive = false;
+      return;
+    }
     if ($('authModal').classList.contains('show')) return;
     scheduleViewportSync();
 
+    if (ev && ev.type === 'online') {
+      reconnectAttempt = 0;
+    }
+
     const now = Date.now();
     // Recycle if beacon resolution or WebSocket handshake froze across iOS sleep
-    if (connectingBeacon && (now - connStartedAt) > 6500) {
+    if (connectingBeacon && (now - connStartedAt) > 14000) {
       connEpoch++;
       connectingBeacon = false;
       connect();
       return;
     }
     if (ws && ws.readyState === 0) {
-      if ((now - connStartedAt) > 4500) {
+      if ((now - connStartedAt) > 12000) {
         connEpoch++;
         const hung = ws;
         ws = null;
@@ -5869,8 +5890,13 @@
       return;
     }
     if (ws.readyState === 1) {
+      const returnedFromHide = wasHidden;
+      wasHidden = false;
+      if (ev && ev.type === 'focus' && !returnedFromHide && (now - lastInboundTs) < 6000) {
+        return;
+      }
       // Reuse active wake probe instead of extending deadline across bursty focus/pageshow/visibility events
-      if (wakeWatchdogActive) return;
+      if (wakeWatchdogActive || ws.bufferedAmount > 65536) return;
       const targetWs = ws;
       const targetEpoch = connEpoch;
       const seqBeforeWake = inboundSeq;
@@ -5878,7 +5904,7 @@
       wakeWatchdogActive = true;
       try {
         targetWs.send(JSON.stringify({ type: 'ping', ts: now }));
-        if (!isStreaming && activeConvStore && activeConvId) {
+        if (!isStreaming && activeConvStore && activeConvId && (returnedFromHide || (now - lastInboundTs) >= 8000)) {
           targetWs.send(JSON.stringify({
             type: 'refresh_conversation',
             conversation_id: activeConvId,
@@ -5888,7 +5914,7 @@
       } catch (_) {}
       pongWatchdog = setTimeout(() => {
         wakeWatchdogActive = false;
-        if (targetEpoch === connEpoch && ws === targetWs && inboundSeq === seqBeforeWake) {
+        if (targetEpoch === connEpoch && ws === targetWs && inboundSeq === seqBeforeWake && document.visibilityState !== 'hidden' && targetWs.bufferedAmount <= 65536) {
           connEpoch++;
           ws = null;
           try { targetWs.close(); } catch (_) {}
@@ -5896,7 +5922,7 @@
           setReconnectBanner(true, '唤醒重连电脑中...');
           connect();
         }
-      }, 2400);
+      }, 6500);
     }
   }
   document.addEventListener('visibilitychange', handleAppWakeup);
