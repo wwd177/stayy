@@ -328,7 +328,7 @@ def load_beacon_state(runtime_dir: Path) -> dict[str, Any]:
 STATIC_PWA_SW_JS = """\
 const SCOPE_SLUG = new URL(self.registration.scope).pathname.replace(/[^a-zA-Z0-9_-]/g, '_');
 const CACHE_PREFIX = 'stayy-ios-shell-' + SCOPE_SLUG + '-';
-const CACHE_NAME = CACHE_PREFIX + 'v3';
+const CACHE_NAME = CACHE_PREFIX + 'v3' + '-__SHELL_HASH__';
 const REQUIRED_SHELL = ['./', './index.html'];
 const OPTIONAL_ASSETS = ['./apple-touch-icon.png', './icon-192.png', './icon-512.png', './manifest.json'];
 
@@ -428,6 +428,7 @@ def build_static_pwa_bundle(
     lan_url: str,
     host_id: str,
     nonce: str | None = None,
+    beacon_branch: str = "gh-pages",
 ) -> tuple[dict[str, Any], str]:
     """Assemble the static iOS Standalone PWA shell + encrypted `beacon.json` into `stage_dir`."""
     stage_dir.mkdir(parents=True, exist_ok=True)
@@ -436,14 +437,19 @@ def build_static_pwa_bundle(
 
     html_text = src_html.read_text(encoding="utf-8")
     repo_slug = f"{owner}/{repo}"
+    safe_branch = _normalize_safe_beacon_branch(beacon_branch) or "gh-pages"
     html_text = html_text.replace(
         '<html lang="zh-CN">',
-        f'<html lang="zh-CN" data-beacon-repo="{repo_slug}">',
+        f'<html lang="zh-CN" data-beacon-repo="{repo_slug}" data-beacon-branch="{safe_branch}">',
         1,
     )
+    html_hash = hashlib.sha256(html_text.encode("utf-8")).hexdigest()[:10]
     (stage_dir / "index.html").write_text(html_text, encoding="utf-8")
     (stage_dir / ".nojekyll").write_text("", encoding="utf-8")
-    (stage_dir / "sw.js").write_text(STATIC_PWA_SW_JS, encoding="utf-8")
+    (stage_dir / "sw.js").write_text(
+        STATIC_PWA_SW_JS.replace("__SHELL_HASH__", html_hash),
+        encoding="utf-8",
+    )
 
     # Never put credentials into manifest start_url
     manifest = {
@@ -619,6 +625,7 @@ def publish_ios_pwa_and_beacon(
                 tunnel_url=tunnel_url,
                 lan_url=lan_url,
                 host_id=host_id,
+                beacon_branch=clean_branch,
             )
 
             def _git(*args: str, timeout: int = 25) -> subprocess.CompletedProcess[str]:

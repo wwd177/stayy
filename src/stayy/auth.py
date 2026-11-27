@@ -214,6 +214,7 @@ class AuthManager:
             load_or_create_host_id(runtime_dir) if runtime_dir is not None else str(uuid.uuid4())
         )
         self._failed_auth: dict[str, list[float]] = {}
+        self._failed_media_auth: dict[str, list[float]] = {}
         self._pairing_codes: OrderedDict[str, float] = OrderedDict()
 
     def _signing_key(self, epoch: int) -> bytes:
@@ -247,6 +248,40 @@ class AuthManager:
             arr = [t for t in self._failed_auth.get(ip, []) if now - t < 60.0]
             arr.append(now)
             self._failed_auth[ip] = arr
+
+    def is_media_ip_locked(self, ip: str) -> bool:
+        """Separate rate limit for `/dl/` media fetches so expired/revoked asset reloads never lock login."""
+        with self._lock:
+            now = time.monotonic()
+            attempts = [t for t in self._failed_media_auth.get(ip, []) if now - t < 60.0]
+            if attempts:
+                self._failed_media_auth[ip] = attempts
+            else:
+                self._failed_media_auth.pop(ip, None)
+            return len(attempts) >= 24
+
+    def record_media_auth_failure(self, ip: str) -> None:
+        """Record an unauthorized `/dl/` media failure without consuming login/pairing quota."""
+        with self._lock:
+            now = time.monotonic()
+            if len(self._failed_media_auth) >= 512 and ip not in self._failed_media_auth:
+                stale_keys = [
+                    k
+                    for k, ts_list in list(self._failed_media_auth.items())
+                    if not ts_list or now - ts_list[-1] >= 60.0
+                ]
+                for k in stale_keys:
+                    self._failed_media_auth.pop(k, None)
+                if len(self._failed_media_auth) >= 512:
+                    oldest_key = next(iter(self._failed_media_auth))
+                    self._failed_media_auth.pop(oldest_key, None)
+            arr = [t for t in self._failed_media_auth.get(ip, []) if now - t < 60.0]
+            arr.append(now)
+            self._failed_media_auth[ip] = arr
+
+    def clear_media_failures(self, ip: str) -> None:
+        with self._lock:
+            self._failed_media_auth.pop(ip, None)
 
     def current_epoch(self) -> int:
         with self._lock:
@@ -328,17 +363,39 @@ class AuthManager:
         with self._lock:
             return self._sign_token("s1", "sess", self.auth_epoch, ttl_sec)
 
-    def issue_media_ticket(self, media_id: str, ttl_sec: float = 120.0) -> str:
+    def issue_media_ticket(self, media_id: str, ttl_sec: float = 3600.0) -> str:
         with self._lock:
             return self._sign_token("m1", (media_id or "").strip(), self.auth_epoch, ttl_sec)
 
-    def verify_media_ticket(self, ticket: str, media_id: str) -> bool:
+    def verify_media_ticket_status(self, ticket: str, media_id: str) -> str:
+        """Return `'valid'`, `'expired'` (valid current-epoch MAC past `exp`), or `'invalid'`."""
         clean_id = (media_id or "").strip()
-        if not clean_id:
-            return False
+        parts = (ticket or "").strip().split(".")
+        if not clean_id or len(parts) != 6:
+            return "invalid"
+        prefix, epoch_s, exp_s, subject, nonce, mac_hex = parts
+        if prefix != "m1" or not nonce or not self._ct_eq(subject, clean_id):
+            return "invalid"
+        try:
+            epoch = int(epoch_s)
+            exp = int(exp_s)
+        except ValueError:
+            return "invalid"
         with self._lock:
-            ok, _ = self._verify_signed_token(ticket, "m1", clean_id)
-            return ok
+            if epoch != self.auth_epoch or epoch <= 0:
+                return "invalid"
+            body = f"{prefix}.{epoch}.{exp}.{subject}.{nonce}"
+            expected_mac = hmac.new(
+                self._signing_key(epoch), body.encode("utf-8"), hashlib.sha256
+            ).hexdigest()[:32]
+            if not self._ct_eq(mac_hex, expected_mac):
+                return "invalid"
+        if exp < int(time.time()):
+            return "expired"
+        return "valid"
+
+    def verify_media_ticket(self, ticket: str, media_id: str) -> bool:
+        return self.verify_media_ticket_status(ticket, media_id) == "valid"
 
     def exchange_pairing_code(
         self, code: str, ip: str, *, session_ttl_sec: float = 86400.0 * 30
@@ -363,6 +420,7 @@ class AuthManager:
                 self.record_auth_failure(ip)
                 return False, "", 0
             self._pairing_codes.pop(matched_key, None)
+            self._failed_media_auth.pop(ip, None)
             sess_tok = self.issue_session_token(ttl_sec=session_ttl_sec)
             return True, sess_tok, self.auth_epoch
 

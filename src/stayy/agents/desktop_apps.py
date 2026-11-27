@@ -7,6 +7,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -363,8 +364,6 @@ def launch_desktop_ai_app(
 
     Returns `(ok, focused, human_note)`.
     """
-    import time
-
     if not APP_ID_RE.match((app_id or "").strip()):
         return False, False, "非法的应用标识符"
     if registered_entry is None:

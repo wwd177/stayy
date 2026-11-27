@@ -41,7 +41,7 @@ from .agents import (
 )
 from .agents.cli_adapters import run_cli_agent_turn
 from .agents.openai_compat import run_openai_compat_turn
-from .agy_session import AgySession, SessionManager, TurnResult, _kill_process_tree_win32
+from .agy_session import STREAM_BUFFER_LIMIT, AgySession, SessionManager, TurnResult, _kill_process_tree_win32
 from .approvals import ApprovalReadonlyTracker, deny_auto_invoke, inspect_ide_actions_readonly
 from .auth import (
     AuthManager,
@@ -1183,10 +1183,44 @@ class WebPwaServer:
         fid = self.register_live_frame(path)
         item: dict[str, Any] = {
             "media_id": fid,
-            "media_ticket": self.auth.issue_media_ticket(fid),
+            "media_ticket": self.auth.issue_media_ticket(fid, ttl_sec=180.0),
         }
         item.update(extra)
         return item
+
+    def _refresh_history_media_tickets(self, history: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Return a shallow-safe copy of `history` with refreshed media tickets (never mutating stored dicts)."""
+        if not history:
+            return []
+        refreshed: list[dict[str, Any]] = []
+        for item in history:
+            if not isinstance(item, dict):
+                refreshed.append(item)
+                continue
+            item_copy = dict(item)
+            for key in ("images", "files", "attachments"):
+                raw_list = item.get(key)
+                if not isinstance(raw_list, list) or not raw_list:
+                    continue
+                new_list: list[Any] = []
+                for sub in raw_list:
+                    if not isinstance(sub, dict):
+                        new_list.append(sub)
+                        continue
+                    sub_copy = dict(sub)
+                    mid = str(sub_copy.get("media_id") or "").strip()
+                    if mid:
+                        if mid in self._media_registry or mid in self._live_frame_registry:
+                            ttl = 180.0 if mid in self._live_frame_registry else 3600.0
+                            sub_copy["media_ticket"] = self.auth.issue_media_ticket(mid, ttl_sec=ttl)
+                            sub_copy.pop("media_unavailable", None)
+                        else:
+                            sub_copy["media_ticket"] = ""
+                            sub_copy["media_unavailable"] = True
+                    new_list.append(sub_copy)
+                item_copy[key] = new_list
+            refreshed.append(item_copy)
+        return refreshed
 
     def _display_model_for_store(self, store: str, fallback: str = "default") -> str:
         if store == "ide":
@@ -1398,6 +1432,7 @@ class WebPwaServer:
                         "application/json; charset=utf-8",
                         {"Cache-Control": "no-store"},
                     )
+                self.auth.clear_media_failures(ip)
                 return self._http_response(
                     200,
                     "OK",
@@ -1427,6 +1462,7 @@ class WebPwaServer:
                 )
             is_https = self._is_https_request(request.headers)
             exp_sec = 2592000 if is_https else 86400
+            self.auth.clear_media_failures(ip)
             sess_tok = self.auth.issue_session_token(ttl_sec=float(exp_sec))
             return self._http_response(
                 200,
@@ -1531,14 +1567,22 @@ class WebPwaServer:
         if path.startswith("/dl/"):
             cors = self._cors_headers(request.headers)
             ip = self._client_ip(connection, request.headers)
+            if self.auth.is_media_ip_locked(ip):
+                return self._http_response(
+                    429,
+                    "Too Many Requests",
+                    b"",
+                    "application/octet-stream",
+                    {"Cache-Control": "no-store", **cors},
+                )
             cred, ticket = self._extract_credential_and_ticket(parsed.query, request.headers)
             media_id = path.removeprefix("/dl/").strip("/")
 
-            ok_cred = bool(cred) and self.auth.verify_credential(cred, ip, record_failure=True)[0]
-            ok_ticket = bool(ticket) and self.auth.verify_media_ticket(ticket, media_id)
-            if not (ok_cred or ok_ticket):
-                if not cred:
-                    self.auth.record_auth_failure(ip)
+            ok_cred = bool(cred) and self.auth.verify_credential(cred, ip, record_failure=False)[0]
+            ticket_status = self.auth.verify_media_ticket_status(ticket, media_id) if ticket else "invalid"
+            if not (ok_cred or ticket_status == "valid"):
+                if ticket_status != "expired":
+                    self.auth.record_media_auth_failure(ip)
                 return self._http_response(
                     401,
                     "Unauthorized",
@@ -2200,7 +2244,7 @@ class WebPwaServer:
                     "inflight": pub_inflight,
                     "slots_overview": self._build_slots_overview(),
                     "cooldowns": session.failover_pool.cooldown_summary(),
-                    "history": self._slot_history.get(slot, []),
+                    "history": self._refresh_history_media_tickets(self._slot_history.get(slot, [])),
                 },
             )
 
@@ -2658,7 +2702,7 @@ class WebPwaServer:
                 "has_more": detail.has_more,
                 "total_messages": detail.total_messages,
                 "slots_overview": self._build_slots_overview(),
-                "history": loaded_history,
+                "history": self._refresh_history_media_tickets(loaded_history),
             }
         )
 
@@ -3218,6 +3262,7 @@ class WebPwaServer:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 cwd=str(workspace) if workspace.is_dir() else None,
+                limit=STREAM_BUFFER_LIMIT,
                 **extra_kwargs,
             )
         except Exception as exc:
@@ -3272,7 +3317,26 @@ class WebPwaServer:
                 remaining = overall_deadline - time.monotonic()
                 if remaining <= 0:
                     raise asyncio.TimeoutError("Codex 执行超时")
-                raw_line = await asyncio.wait_for(proc.stdout.readline(), timeout=remaining)
+                try:
+                    raw_line = await asyncio.wait_for(proc.stdout.readline(), timeout=remaining)
+                except ValueError as exc:
+                    logger.warning("Codex stdout line exceeded buffer limit (%s): %s", codex_cid[:8] or "new", exc)
+                    if proc.returncode is None:
+                        try:
+                            if sys.platform == "win32" and proc.pid:
+                                await asyncio.to_thread(_kill_process_tree_win32, proc.pid)
+                            else:
+                                proc.kill()
+                            await asyncio.wait_for(proc.wait(), timeout=2.0)
+                        except Exception:
+                            pass
+                    return TurnResult(
+                        status="ERROR",
+                        response="\n\n".join(emitted_blocks),
+                        conversation_id=resolved_cid,
+                        active_model="Codex 电脑端",
+                        error="Codex 单行输出超过 10MB 安全上限，已安全终止该轮执行",
+                    )
                 if not raw_line:
                     break
                 line = raw_line.decode("utf-8", errors="replace").strip()
@@ -3602,6 +3666,11 @@ class WebPwaServer:
             "attachments": [
                 {
                     "media_id": a.get("media_id"),
+                    "media_ticket": (
+                        self.auth.issue_media_ticket(str(a.get("media_id") or ""))
+                        if (a.get("media_id") and str(a.get("media_id")) in self._media_registry)
+                        else str(a.get("media_ticket") or "")
+                    ),
                     "name": a.get("name"),
                     "is_image": bool(a.get("is_image")),
                 }
@@ -4558,7 +4627,7 @@ class WebPwaServer:
             "silent": True,
             "has_more": detail.has_more,
             "total_messages": detail.total_messages,
-            "history": loaded_history,
+            "history": self._refresh_history_media_tickets(loaded_history),
         }
         await self._broadcast(outbound)
 
@@ -4639,7 +4708,7 @@ class WebPwaServer:
                 raw_body = await asyncio.wait_for(reader.readexactly(clen), timeout=4.0)
 
             provided = hdrs.get("x-admin-token", "")
-            if not provided or not hmac.compare_digest(provided, self.admin_secret):
+            if not provided or not hmac.compare_digest(provided.encode("utf-8"), self.admin_secret.encode("utf-8")):
                 status, reason, payload = 403, "Forbidden", {"ok": False, "error": "forbidden"}
             elif method == "GET" and raw_path == "/admin/health":
                 async with self._clients_lock:

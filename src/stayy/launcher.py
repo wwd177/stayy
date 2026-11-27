@@ -538,22 +538,35 @@ def probe_tunnel_e2e_ping(tunnel_url: str, expected_service: str, timeout: float
     clean = (tunnel_url or "").strip().rstrip("/")
     if not clean:
         return False
-    req = urllib.request.Request(
-        f"{clean}/ping?_t={int(time.time())}",
-        headers={"Cache-Control": "no-store"},
-    )
+
+    def _parse_ping(resp: object) -> bool:
+        if getattr(resp, "status", 0) != 200:
+            return False
+        data = json.loads(resp.read(4096).decode("utf-8", errors="replace"))
+        return (
+            isinstance(data, dict)
+            and data.get("ok") is True
+            and data.get("service") == expected_service
+        )
+
+    hdrs = {"Cache-Control": "no-store", "User-Agent": "StayyLauncher/1.0"}
+    req1 = urllib.request.Request(f"{clean}/ping?_t={int(time.time())}", headers=hdrs)
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            if resp.status != 200:
-                return False
-            data = json.loads(resp.read(4096).decode("utf-8", errors="replace"))
-            return (
-                isinstance(data, dict)
-                and data.get("ok") is True
-                and data.get("service") == expected_service
-            )
+        with urllib.request.urlopen(req1, timeout=timeout) as resp:
+            if _parse_ping(resp):
+                return True
     except Exception:
-        return False
+        pass
+
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    req2 = urllib.request.Request(f"{clean}/ping?_t={int(time.time())}", headers=hdrs)
+    try:
+        with opener.open(req2, timeout=min(float(timeout), 4.0)) as resp:
+            if _parse_ping(resp):
+                return True
+    except Exception:
+        pass
+    return False
 
 
 def find_external_server_processes(exclude_pids: set[int]) -> list[int]:
@@ -697,14 +710,12 @@ class LauncherApp:
         self._busy = False
         self._closing = False
 
-        gh_info = resolve_explicit_beacon_target(
-            settings.project_dir,
-            beacon_enabled=settings.beacon_enabled,
-            explicit_remote=settings.beacon_git_remote,
-            allow_upstream_protected=settings.beacon_allow_upstream,
-        )
-        self._ios_pages_url: str = gh_info[3] if gh_info else ""
+        self._ios_pages_url: str = ""
         self._beacon_synced: bool = False
+        self._poll_state_lock = threading.Lock()
+        self._poll_running: bool = False
+        self._poll_rerun_pending: bool = False
+        self._refresh_beacon_target_from_settings()
         saved_bstate = load_beacon_state(RUNTIME_DIR)
         self._beacon_state: str = str(saved_bstate.get("state") or ("waiting_pages" if self._ios_pages_url else "disabled"))
         self._beacon_pending_nonce: str = str(saved_bstate.get("pending_nonce") or "")
@@ -1560,6 +1571,17 @@ class LauncherApp:
         except Exception:
             return None
 
+    def _refresh_beacon_target_from_settings(self) -> None:
+        gh_info = resolve_explicit_beacon_target(
+            self.settings.project_dir,
+            beacon_enabled=self.settings.beacon_enabled,
+            explicit_remote=self.settings.beacon_git_remote,
+            allow_upstream_protected=self.settings.beacon_allow_upstream,
+        )
+        self._ios_pages_url = gh_info[3] if gh_info else ""
+        if hasattr(self, "_beacon_target_cache"):
+            self._beacon_target_cache.clear()
+
     def _refresh_pair_code_worker(self) -> None:
         res = self._admin_request("POST", "/admin/pair")
         if res and res.get("ok") and res.get("code"):
@@ -1574,6 +1596,7 @@ class LauncherApp:
             self._enqueue_log("安全", "撤销失败：Stayy 服务未就绪或写入 .env 失败。", "err")
             return
         self.settings = load_settings()
+        self._refresh_beacon_target_from_settings()
         closed_n = int(res.get("closed_clients") or 0)
         new_ep = int(res.get("auth_epoch") or 0)
         self._active_pair_code = ""
@@ -2113,6 +2136,33 @@ class LauncherApp:
         self.root.after(3500, self._schedule_health_poll)
 
     def _health_poll_worker(self, force: bool = False) -> None:
+        with self._poll_state_lock:
+            if self._poll_running:
+                if force:
+                    self._poll_rerun_pending = True
+                return
+            self._poll_running = True
+        try:
+            while True:
+                try:
+                    self._health_poll_once(force=force)
+                except Exception as exc:
+                    if not self._closing and hasattr(self, "_enqueue_log"):
+                        self._enqueue_log("系统", f"健康轮询异常：{exc}", "warn")
+                with self._poll_state_lock:
+                    if self._poll_rerun_pending and not self._closing:
+                        self._poll_rerun_pending = False
+                        force = True
+                        continue
+                    self._poll_running = False
+                    return
+        except BaseException:
+            with self._poll_state_lock:
+                self._poll_running = False
+                self._poll_rerun_pending = False
+            raise
+
+    def _health_poll_once(self, force: bool = False) -> None:
         if self._closing or (self._busy and not force):
             return
         gw_ident = probe_stayy_gateway_identity("127.0.0.1", self.settings.web_pwa_port, timeout=0.45)
@@ -2360,6 +2410,11 @@ class LauncherApp:
             set_prevent_system_sleep(True)
         self._auto_restart_timestamps.clear()
         self.settings = load_settings()
+        self._refresh_beacon_target_from_settings()
+        if self._ios_pages_url and getattr(self, "_beacon_state", "") == "disabled":
+            self._beacon_state = "waiting_pages"
+        elif not self._ios_pages_url and not self.settings.beacon_enabled:
+            self._beacon_state = "disabled"
         self._post_ui(self._render_inline_qr)
         threading.Thread(target=self._refresh_conv_stats_bg, daemon=True).start()
 
@@ -2475,6 +2530,7 @@ class LauncherApp:
         self._tunnel_last_e2e_check_mono = 0.0
         self._tunnel_e2e_fail_count = 0
         self._tunnel_url = ""
+        self._beacon_synced = False
         cmd = [
             str(cf_exe),
             "tunnel",
@@ -2598,10 +2654,11 @@ class LauncherApp:
             return
         lan_url = f"http://{get_lan_ipv4()}:{self.settings.web_pwa_port}"
         eff_tunnel = (tunnel_url or "").strip() or lan_url
+        snap_token = self.settings.web_access_token
         meta: dict[str, Any] = {}
         ok, state_code, info = publish_ios_pwa_and_beacon(
             self.settings.project_dir,
-            access_token=self.settings.web_access_token,
+            access_token=snap_token,
             tunnel_url=eff_tunnel,
             lan_url=lan_url,
             host_id=self._host_id,
@@ -2613,7 +2670,7 @@ class LauncherApp:
             runtime_dir=RUNTIME_DIR,
             out_meta=meta,
         )
-        if tun_gen and tun_gen != self._tunnel_gen:
+        if (tun_gen and tun_gen != self._tunnel_gen) or snap_token != self.settings.web_access_token:
             return
         self._beacon_state = state_code
         self._beacon_pending_nonce = str(meta.get("pending_nonce") or self._beacon_pending_nonce)
@@ -2656,6 +2713,7 @@ class LauncherApp:
         self._tunnel_ready_conns = 0
         self._tunnel_unready_since_mono = 0.0
         self._tunnel_e2e_fail_count = 0
+        self._beacon_synced = False
 
         if self._server_proc and self._server_proc.poll() is None:
             kill_pid_tree(self._server_proc.pid)
@@ -2687,7 +2745,9 @@ class LauncherApp:
         self.log_text.configure(state=tk.DISABLED)
 
     def _has_running_managed_services(self) -> bool:
-        return self._server_proc is not None and self._server_proc.poll() is None
+        srv_alive = self._server_proc is not None and self._server_proc.poll() is None
+        tun_alive = self._tunnel_proc is not None and self._tunnel_proc.poll() is None
+        return srv_alive or tun_alive
 
     def _on_close_requested(self) -> None:
         if self._has_running_managed_services():
@@ -2731,6 +2791,7 @@ class LauncherApp:
             return
 
         self._closing = True
+        self._stop_all_internal(include_external=False)
         self.root.destroy()
 
 
